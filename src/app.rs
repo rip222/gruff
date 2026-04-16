@@ -9,6 +9,7 @@ use crate::colors;
 use crate::config::{self, Config};
 use crate::error::{self, GruffError};
 use crate::export;
+use crate::filter_state::FilterState;
 use crate::graph::{Graph, GraphDiff, NodeId};
 use crate::indexer::Indexer;
 use crate::layout::Layout;
@@ -125,6 +126,11 @@ pub struct GruffApp {
     /// Root of the currently-loaded folder, kept so Cmd+R can rescan the
     /// same folder without a file picker round-trip.
     last_root: Option<PathBuf>,
+    /// Session-scoped visibility filter. Nodes whose id is in the hide set
+    /// are excluded from rendering, physics, and cycle detection. Reset to
+    /// empty on every folder open per PRD #16 — the filter is memory-only
+    /// and never persisted.
+    filter_state: FilterState,
 }
 
 impl Default for GruffApp {
@@ -154,6 +160,7 @@ impl Default for GruffApp {
             indexer: None,
             watcher: None,
             last_root: None,
+            filter_state: FilterState::new(),
         }
     }
 }
@@ -196,6 +203,11 @@ impl GruffApp {
             let _ = config::save(&self.config);
         }
 
+        // Filter state is session-scoped: opening a new folder starts fresh
+        // with every node visible. Must run *before* `rebuild_derived_indexes`
+        // so cycles are computed against the full (unfiltered) new graph.
+        self.filter_state.clear();
+
         self.rebuild_derived_indexes();
         self.frame_request = None;
         self.highlight = None;
@@ -205,7 +217,7 @@ impl GruffApp {
         self.search = None;
 
         self.layout = Layout::new();
-        self.layout.sync(&self.graph);
+        self.layout.sync(&self.visible_graph());
         self.selected = None;
         self.camera = Camera::new();
         // Run physics synchronously up to ~500 ticks / ~300 ms so the first
@@ -259,7 +271,7 @@ impl GruffApp {
         self.graph = indexer.graph.clone();
         self.unresolved_dynamic = indexer.unresolved_dynamic;
         self.rebuild_derived_indexes();
-        self.layout.sync(&self.graph);
+        self.resync_layout();
         self.frame_request = None;
         self.highlight = None;
         // A node that was just filtered out of the graph can't stay
@@ -290,7 +302,7 @@ impl GruffApp {
             return;
         }
         self.rebuild_derived_indexes();
-        self.layout.sync(&self.graph);
+        self.resync_layout();
         self.frame_request = None;
         self.highlight = None;
         self.selected = None;
@@ -300,6 +312,13 @@ impl GruffApp {
     /// Rebuild adjacency lists, package color indices, and cycles from the
     /// current `self.graph`. Called after full scans and after every
     /// non-empty incremental diff.
+    ///
+    /// Adjacency and package color indices cover the *full* graph — they back
+    /// sidebar sections and the package-color map that must keep a stable
+    /// identity across filter toggles. Cycles, by contrast, run against the
+    /// *visible subgraph* per PRD #16's "Visibility semantics": hiding a node
+    /// that bridged a cycle must drop that cycle from the sidebar, and
+    /// un-hiding it must bring it back.
     fn rebuild_derived_indexes(&mut self) {
         self.imports.clear();
         self.imported_by.clear();
@@ -334,7 +353,21 @@ impl GruffApp {
             self.package_indices.insert(name.to_string(), next);
         }
 
-        self.cycles = self.graph.cycles();
+        self.recompute_cycles();
+    }
+
+    /// Recompute the visible-subgraph cycle set and its reverse index.
+    /// Isolated so filter toggles can refresh cycles without touching the
+    /// full-graph adjacency/color indexes above.
+    fn recompute_cycles(&mut self) {
+        let source = if self.filter_state.is_empty() {
+            // Fast path: nothing hidden, so the visible subgraph equals the
+            // full graph and we can skip the clone.
+            self.graph.cycles()
+        } else {
+            self.visible_graph().cycles()
+        };
+        self.cycles = source;
         for cycle in &mut self.cycles {
             cycle.sort();
         }
@@ -346,6 +379,87 @@ impl GruffApp {
                 self.cycle_of.insert(node.clone(), idx);
             }
         }
+    }
+
+    /// Build a clone of `self.graph` with hidden nodes and incident edges
+    /// removed. Used by layout-sync and cycle detection so hidden nodes are
+    /// absent from both the physics sim and the cycle report. Cheap enough
+    /// (one pass, no heavy data) to rebuild on every toggle; we avoid the
+    /// clone entirely when the filter is empty via [`Self::recompute_cycles`]
+    /// and [`Self::resync_layout`].
+    fn visible_graph(&self) -> Graph {
+        let mut g = Graph::new();
+        for (id, node) in &self.graph.nodes {
+            if self.filter_state.is_hidden(id) {
+                continue;
+            }
+            g.add_node(node.clone());
+        }
+        for edge in &self.graph.edges {
+            if self.filter_state.is_hidden(&edge.from)
+                || self.filter_state.is_hidden(&edge.to)
+            {
+                continue;
+            }
+            g.add_edge(&edge.from, &edge.to);
+        }
+        g
+    }
+
+    /// Re-sync the layout against the current visible subgraph. Hidden nodes
+    /// drop out of the simulation (freeing their space for remaining nodes
+    /// to redistribute into); previously-hidden nodes that are unhidden get
+    /// a fresh spiral seed. Uses the full graph directly when nothing is
+    /// hidden to skip the clone.
+    fn resync_layout(&mut self) {
+        if self.filter_state.is_empty() {
+            self.layout.sync(&self.graph);
+        } else {
+            self.layout.sync(&self.visible_graph());
+        }
+    }
+
+    /// React to a file-level filter toggle: drop hidden nodes from the
+    /// simulation so remaining nodes redistribute, recompute cycles on the
+    /// visible subgraph, and request the camera to tween to the new bbox
+    /// over ~200-300 ms. Selection / highlight that refer to a now-hidden
+    /// node are cleared so stale sidebar content doesn't linger.
+    ///
+    /// Callers must update `self.filter_state` *before* invoking this — the
+    /// helper reads the post-toggle state to decide what's visible.
+    fn apply_filter_change(&mut self) {
+        self.resync_layout();
+        self.recompute_cycles();
+
+        // Drop stale selection / highlight pointing at a now-hidden node.
+        if let Some(selected) = self.selected.clone() {
+            if self.filter_state.is_hidden(&selected) {
+                self.selected = None;
+                self.highlight = None;
+            }
+        }
+
+        // Tween the camera to the new visible-subgraph bbox. The canvas
+        // consumes this request on the next frame, which is where it has
+        // the rect dimensions needed for `Camera::fit`. Uses the `Tween`
+        // variant so the transition reads as motion rather than a jump cut
+        // — exactly the "~200-300 ms" target from PRD #16's
+        // "Camera fit-on-filter-change flow".
+        self.fit_request = Some(FitMode::Tween);
+    }
+
+    /// Apply a batch of file-level visibility toggles produced by the
+    /// sidebar's file checkboxes. No-op for an empty batch so the sidebar
+    /// can call unconditionally each frame without worrying about
+    /// triggering a tween on idle frames.
+    pub(super) fn toggle_file_visibility(&mut self, ids: &[NodeId]) {
+        if ids.is_empty() {
+            return;
+        }
+        for id in ids {
+            self.filter_state.toggle(id);
+        }
+        self.apply_filter_change();
     }
 
     fn set_status_after_index(&mut self, elapsed: Duration) {
@@ -424,7 +538,14 @@ impl GruffApp {
             return;
         };
 
-        let exported = export::build_export(&self.graph, &self.cycles, self.last_root.as_deref());
+        // Export reflects the *full* graph — filtered export is explicitly
+        // out of scope for PRD #16. Since `self.cycles` now tracks the
+        // visible-subgraph cycles (per #22), recompute against the full
+        // graph here so the exported JSON stays consistent with its nodes
+        // and edges.
+        let full_cycles = self.graph.cycles();
+        let exported =
+            export::build_export(&self.graph, &full_cycles, self.last_root.as_deref());
         match export::write_json(&target, &exported) {
             Ok(()) => {
                 self.status = format!(
@@ -473,8 +594,10 @@ impl GruffApp {
 
         // Layout's `sync` preserves existing node positions and seeds new
         // ones on a spiral, so the simulation absorbs the diff in place
-        // without restarting from scratch.
-        self.layout.sync(&self.graph);
+        // without restarting from scratch. Watcher-driven updates preserve
+        // the current filter state (resets only happen on explicit folder
+        // open), so sync against the visible subgraph.
+        self.resync_layout();
         self.rebuild_derived_indexes();
 
         // Clear selection/highlight if the affected node is gone — stale
@@ -754,5 +877,192 @@ mod tests {
         // place that arms it, based on post-settle velocity.
         let app = GruffApp::default();
         assert!(!app.auto_refit);
+    }
+
+    // --- Filter plumbing (#22) --------------------------------------------
+
+    use crate::graph::{Node, NodeKind};
+    use std::path::PathBuf;
+
+    fn file_node(id: &str) -> Node {
+        Node {
+            id: id.to_string(),
+            path: PathBuf::from(id),
+            label: id.to_string(),
+            package: None,
+            kind: NodeKind::File,
+        }
+    }
+
+    /// Seed a fresh app with `graph`. Mirrors the subset of `load_folder`
+    /// that matters for filter-flow tests — graph install, derived indexes,
+    /// layout sync, fresh filter — without touching the filesystem, the
+    /// watcher, or the indexer.
+    fn app_with_graph(graph: Graph) -> GruffApp {
+        let mut app = GruffApp {
+            graph,
+            ..GruffApp::default()
+        };
+        app.filter_state.clear();
+        app.rebuild_derived_indexes();
+        app.resync_layout();
+        app
+    }
+
+    fn abc_cycle_graph() -> Graph {
+        // a -> b -> c -> a — the PRD's canonical "hide B breaks the cycle"
+        // fixture.
+        let mut g = Graph::new();
+        for id in ["a", "b", "c"] {
+            g.add_node(file_node(id));
+        }
+        g.add_edge("a", "b");
+        g.add_edge("b", "c");
+        g.add_edge("c", "a");
+        g
+    }
+
+    #[test]
+    fn hiding_middle_of_cycle_drops_cycle_from_sidebar() {
+        // A→B→C→A with B hidden leaves A→C and C→A dangling as unrelated
+        // edges once B is out — the SCC collapses and the cycles list
+        // empties. Acceptance criterion from #22.
+        let mut app = app_with_graph(abc_cycle_graph());
+        assert_eq!(app.cycles.len(), 1, "precondition: one cycle before hide");
+
+        app.toggle_file_visibility(&["b".to_string()]);
+        assert!(app.filter_state.is_hidden("b"));
+        assert!(
+            app.cycles.is_empty(),
+            "hiding B must drop the A->B->C->A cycle from the visible subgraph"
+        );
+    }
+
+    #[test]
+    fn unhiding_brings_cycle_back() {
+        // Reverse of the above: toggling B off, then on, restores the
+        // cycle. The filter round-trip is fully reversible in memory per
+        // PRD #16's "session-scoped, reset only on new folder open".
+        let mut app = app_with_graph(abc_cycle_graph());
+        app.toggle_file_visibility(&["b".to_string()]);
+        assert!(app.cycles.is_empty());
+
+        app.toggle_file_visibility(&["b".to_string()]);
+        assert!(!app.filter_state.is_hidden("b"));
+        assert_eq!(
+            app.cycles.len(),
+            1,
+            "unhiding B must bring the cycle back on the visible subgraph"
+        );
+    }
+
+    #[test]
+    fn hiding_one_of_two_disjoint_cycles_leaves_the_other() {
+        // Two independent SCCs: {a,b} and {c,d,e} joined by a one-way
+        // bridge. Hiding `a` kills the {a,b} cycle; {c,d,e} must survive
+        // untouched.
+        let mut g = Graph::new();
+        for id in ["a", "b", "c", "d", "e"] {
+            g.add_node(file_node(id));
+        }
+        g.add_edge("a", "b");
+        g.add_edge("b", "a");
+        g.add_edge("b", "c"); // one-way bridge
+        g.add_edge("c", "d");
+        g.add_edge("d", "e");
+        g.add_edge("e", "c");
+
+        let mut app = app_with_graph(g);
+        assert_eq!(app.cycles.len(), 2, "precondition: two cycles");
+
+        app.toggle_file_visibility(&["a".to_string()]);
+        assert_eq!(
+            app.cycles.len(),
+            1,
+            "hiding `a` must leave exactly the {{c,d,e}} cycle"
+        );
+        let remaining: std::collections::BTreeSet<_> =
+            app.cycles[0].iter().cloned().collect();
+        let expected: std::collections::BTreeSet<_> =
+            ["c", "d", "e"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(remaining, expected);
+    }
+
+    #[test]
+    fn filter_change_requests_camera_tween() {
+        // Acceptance criterion: Camera::fit tweens on every filter change.
+        // The canvas consumes `fit_request` on the next frame; asserting
+        // the request type here is the observable proxy for "tween fires"
+        // without standing up an egui context.
+        let mut app = app_with_graph(abc_cycle_graph());
+        assert!(app.fit_request.is_none(), "precondition: no pending fit");
+        app.toggle_file_visibility(&["b".to_string()]);
+        assert_eq!(
+            app.fit_request,
+            Some(FitMode::Tween),
+            "filter change must request a camera tween, not a snap"
+        );
+    }
+
+    #[test]
+    fn hidden_nodes_leave_physics_simulation() {
+        // Layout must drop hidden nodes entirely so remaining nodes can
+        // redistribute into the freed space. We don't run the sim; we
+        // just assert the hidden node is no longer present in the layout
+        // after a toggle.
+        let mut app = app_with_graph(abc_cycle_graph());
+        assert_eq!(app.layout.len(), 3);
+        app.toggle_file_visibility(&["b".to_string()]);
+        assert!(
+            !app.layout.contains("b"),
+            "hidden node must be absent from the physics simulation"
+        );
+        assert_eq!(
+            app.layout.len(),
+            2,
+            "remaining nodes stay in the simulation"
+        );
+    }
+
+    #[test]
+    fn unhiding_a_node_reseeds_it_in_the_layout() {
+        // Reversibility for the layout: a hidden-then-unhidden node
+        // reappears in the simulation at a fresh spiral seed. No edge-
+        // state checks here (that's the cycle test); just that the node
+        // rejoins the flat layout arrays.
+        let mut app = app_with_graph(abc_cycle_graph());
+        app.toggle_file_visibility(&["b".to_string()]);
+        assert!(!app.layout.contains("b"));
+        app.toggle_file_visibility(&["b".to_string()]);
+        assert!(
+            app.layout.contains("b"),
+            "unhidden node must reappear in the physics simulation"
+        );
+    }
+
+    #[test]
+    fn clearing_selection_when_selected_node_is_hidden() {
+        // A stale selection pointing at a now-hidden node would render as
+        // dangling sidebar content. The filter-change flow must drop it.
+        let mut app = app_with_graph(abc_cycle_graph());
+        app.selected = Some("b".to_string());
+        app.toggle_file_visibility(&["b".to_string()]);
+        assert!(
+            app.selected.is_none(),
+            "hiding the selected node must clear the selection"
+        );
+    }
+
+    #[test]
+    fn empty_toggle_batch_is_a_noop() {
+        // An empty toggle batch (e.g. a frame with no checkbox clicks)
+        // must not kick off a camera tween or disturb cycle state. Sidebar
+        // calls `toggle_file_visibility` unconditionally, so the guard
+        // matters for perceived smoothness.
+        let mut app = app_with_graph(abc_cycle_graph());
+        assert!(app.fit_request.is_none());
+        app.toggle_file_visibility(&[]);
+        assert!(app.fit_request.is_none());
+        assert_eq!(app.cycles.len(), 1);
     }
 }

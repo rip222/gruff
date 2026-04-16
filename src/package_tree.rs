@@ -17,15 +17,18 @@
 //! files, and folder/file siblings under each package.
 //!
 //! Checkbox state is tracked on every tree node so the sidebar can render a
-//! checkbox at every level. In this slice the checkboxes are visible but
-//! inert — visibility semantics land in issue #22. The tree still threads
-//! `CheckState` through so the renderer can wire a real toggle without
-//! reshaping the data later.
+//! checkbox at every level. File-level `CheckState` reflects the caller's
+//! [`FilterState`] hide set — hidden files render as `Unchecked`, visible
+//! files render as `Checked`. Package- and folder-level tristate cascade
+//! lands in #23; until then parent rows always render `Checked` regardless
+//! of their descendants.
 //!
 //! Kept egui-free and purely data-driven. See `tests` for structural
 //! assertions that don't require a renderer.
+//!
+//! [`FilterState`]: crate::filter_state::FilterState
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use crate::graph::{Graph, NodeId, NodeKind};
@@ -37,15 +40,18 @@ pub const UNPACKAGED_LABEL: &str = "(unpackaged)";
 /// Display label for the externals bucket.
 pub const EXTERNALS_LABEL: &str = "externals";
 
-/// Three-state checkbox. Not exercised in this slice — visibility semantics
-/// arrive in #22 — but present so the renderer can bind to it without a
-/// follow-up data shape change.
+/// Three-state checkbox. File-level leaves use `Checked`/`Unchecked` to
+/// reflect the caller's [`FilterState`] hide set. `Mixed` is reserved for
+/// parent rows once tristate/cascade lands in #23; until then parents
+/// always build as `Checked`.
+///
+/// [`FilterState`]: crate::filter_state::FilterState
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckState {
     Checked,
     Unchecked,
     /// Mixed: some descendants checked, others unchecked. Produced by a
-    /// future filter layer; always `Checked` at build time.
+    /// future filter layer; not yet built by [`PackageTree::build`].
     Mixed,
 }
 
@@ -169,12 +175,18 @@ impl PackageTree {
     /// `None` for `color_index` so tests and downstream code that don't care
     /// about colors can pass an empty map.
     ///
+    /// `hidden` is the current filter's hide set. File leaves whose id is in
+    /// the set render as [`CheckState::Unchecked`]; all other leaves (and
+    /// every parent-level `CheckState`) stay `Checked` in this slice —
+    /// tristate/cascade for package and folder rows lands in #23.
+    ///
     /// Alphabetical ordering is enforced at every level: packages, external
     /// leaves, unpackaged files, and folder/file siblings under each
     /// package.
     pub fn build(
         graph: &Graph,
         package_indices: &std::collections::HashMap<String, usize>,
+        hidden: &HashSet<NodeId>,
     ) -> Self {
         // Partition nodes into three disjoint sets: workspace files grouped
         // by package name, externals, and unpackaged files. Synthetic
@@ -209,7 +221,7 @@ impl PackageTree {
             .into_iter()
             .map(|(name, nodes)| {
                 let common_prefix = common_dir_prefix(nodes.iter().map(|n| n.path.as_path()));
-                let children = build_children(&nodes, &common_prefix);
+                let children = build_children(&nodes, &common_prefix, hidden);
                 PackageNode {
                     color_index: package_indices.get(&name).copied(),
                     name,
@@ -229,7 +241,7 @@ impl PackageTree {
                 .map(|n| ExternalLeaf {
                     id: n.id.clone(),
                     label: n.label.clone(),
-                    check: CheckState::Checked,
+                    check: check_from_hidden(&n.id, hidden),
                 })
                 .collect(),
             check: CheckState::Checked,
@@ -246,7 +258,7 @@ impl PackageTree {
                 .map(|n| FileLeaf {
                     id: n.id.clone(),
                     label: n.label.clone(),
-                    check: CheckState::Checked,
+                    check: check_from_hidden(&n.id, hidden),
                 })
                 .collect(),
             check: CheckState::Checked,
@@ -270,8 +282,13 @@ impl PackageTree {
 
 /// Build the ordered alphabetical child list for a package subtree. Each
 /// file's path is made relative to `common_prefix`, then walked component by
-/// component to build folders.
-fn build_children(nodes: &[&crate::graph::Node], common_prefix: &Path) -> Vec<FolderChild> {
+/// component to build folders. `hidden` threads through so leaf file
+/// [`CheckState`]s reflect the current filter.
+fn build_children(
+    nodes: &[&crate::graph::Node],
+    common_prefix: &Path,
+    hidden: &HashSet<NodeId>,
+) -> Vec<FolderChild> {
     // Insert into a temporary intermediate tree keyed by component name.
     // `BTreeMap` gives us alphabetical folder-vs-folder / file-vs-file
     // ordering for free; we only have to interleave the two at flatten time.
@@ -288,10 +305,15 @@ fn build_children(nodes: &[&crate::graph::Node], common_prefix: &Path) -> Vec<Fo
             .strip_prefix(common_prefix)
             .unwrap_or(&node.path)
             .to_path_buf();
-        insert_file(&mut root, &rel, node);
+        insert_file(&mut root, &rel, node, hidden);
     }
 
-    fn insert_file(inter: &mut Inter, rel: &Path, node: &crate::graph::Node) {
+    fn insert_file(
+        inter: &mut Inter,
+        rel: &Path,
+        node: &crate::graph::Node,
+        hidden: &HashSet<NodeId>,
+    ) {
         let mut comps: Vec<String> = rel
             .components()
             .filter_map(|c| match c {
@@ -306,7 +328,7 @@ fn build_children(nodes: &[&crate::graph::Node], common_prefix: &Path) -> Vec<Fo
                 FileLeaf {
                     id: node.id.clone(),
                     label: node.label.clone(),
-                    check: CheckState::Checked,
+                    check: check_from_hidden(&node.id, hidden),
                 },
             );
             return;
@@ -321,7 +343,7 @@ fn build_children(nodes: &[&crate::graph::Node], common_prefix: &Path) -> Vec<Fo
             FileLeaf {
                 id: node.id.clone(),
                 label: node.label.clone(),
-                check: CheckState::Checked,
+                check: check_from_hidden(&node.id, hidden),
             },
         );
     }
@@ -347,6 +369,18 @@ fn build_children(nodes: &[&crate::graph::Node], common_prefix: &Path) -> Vec<Fo
     }
 
     flatten(root)
+}
+
+/// Map a leaf's id to a [`CheckState`] given the caller's hide set:
+/// `Unchecked` when the id is hidden, `Checked` otherwise. Used uniformly
+/// for every file leaf and every external leaf so the tree mirrors the
+/// filter without pulling `FilterState` into this module.
+fn check_from_hidden(id: &NodeId, hidden: &HashSet<NodeId>) -> CheckState {
+    if hidden.contains(id) {
+        CheckState::Unchecked
+    } else {
+        CheckState::Checked
+    }
 }
 
 /// Longest directory prefix shared by every path in `paths`. Returns an
@@ -493,7 +527,7 @@ mod tests {
     #[test]
     fn build_produces_expected_shape_from_mixed_graph() {
         let (g, idx) = build_fixture();
-        let tree = PackageTree::build(&g, &idx);
+        let tree = PackageTree::build(&g, &idx, &HashSet::new());
 
         // Exactly three packages, alphabetical: alpha, beta, gamma.
         let pkg_names: Vec<&str> = tree.packages.iter().map(|p| p.name.as_str()).collect();
@@ -530,7 +564,7 @@ mod tests {
     #[test]
     fn alphabetical_ordering_at_every_level() {
         let (g, idx) = build_fixture();
-        let tree = PackageTree::build(&g, &idx);
+        let tree = PackageTree::build(&g, &idx, &HashSet::new());
 
         // Packages alphabetical.
         let names: Vec<&str> = tree.packages.iter().map(|p| p.name.as_str()).collect();
@@ -583,7 +617,7 @@ mod tests {
     #[test]
     fn package_subtree_nests_folders_and_files() {
         let (g, idx) = build_fixture();
-        let tree = PackageTree::build(&g, &idx);
+        let tree = PackageTree::build(&g, &idx, &HashSet::new());
 
         // alpha has files all under src/, with one under src/deep/.
         // Common directory prefix is the package's src/, so alpha's
@@ -610,7 +644,7 @@ mod tests {
         // Common prefix is `packages/gamma/`, so gamma's children are
         // `entry.ts` and a folder `utils/` containing `helper.ts`.
         let (g, idx) = build_fixture();
-        let tree = PackageTree::build(&g, &idx);
+        let tree = PackageTree::build(&g, &idx, &HashSet::new());
 
         let gamma = tree
             .packages
@@ -636,7 +670,7 @@ mod tests {
         // beta has one file; common prefix equals its parent dir so the
         // single child is the file itself, not a redundant folder chain.
         let (g, idx) = build_fixture();
-        let tree = PackageTree::build(&g, &idx);
+        let tree = PackageTree::build(&g, &idx, &HashSet::new());
 
         let beta = tree
             .packages
@@ -653,7 +687,7 @@ mod tests {
     #[test]
     fn empty_graph_produces_empty_tree() {
         let g = Graph::new();
-        let tree = PackageTree::build(&g, &HashMap::new());
+        let tree = PackageTree::build(&g, &HashMap::new(), &HashSet::new());
         assert!(tree.is_empty());
         assert!(tree.packages.is_empty());
         assert!(tree.externals.externals.is_empty());
@@ -669,7 +703,7 @@ mod tests {
         g.add_node(workspace_agg("alpha"));
         g.add_node(workspace_agg("beta"));
         g.add_node(external("lodash"));
-        let tree = PackageTree::build(&g, &HashMap::new());
+        let tree = PackageTree::build(&g, &HashMap::new(), &HashSet::new());
         assert!(tree.packages.is_empty());
         assert_eq!(tree.externals.externals.len(), 1);
     }
@@ -684,17 +718,18 @@ mod tests {
             "/repo/packages/solo/a.ts",
             Some("solo"),
         ));
-        let tree = PackageTree::build(&g, &HashMap::new());
+        let tree = PackageTree::build(&g, &HashMap::new(), &HashSet::new());
         assert_eq!(tree.packages.len(), 1);
         assert_eq!(tree.packages[0].color_index, None);
     }
 
     #[test]
     fn default_check_state_is_checked_everywhere() {
-        // Visibility semantics land in #22; in this slice every checkbox
-        // starts Checked so the rendered tree doesn't look pre-filtered.
+        // With an empty hide set, every leaf (and every parent) renders as
+        // Checked — the "nothing hidden" baseline callers see on a fresh
+        // folder load before any user toggle.
         let (g, idx) = build_fixture();
-        let tree = PackageTree::build(&g, &idx);
+        let tree = PackageTree::build(&g, &idx, &HashSet::new());
 
         assert_eq!(tree.unpackaged.check, CheckState::Checked);
         assert_eq!(tree.externals.check, CheckState::Checked);
@@ -717,6 +752,53 @@ mod tests {
             assert_eq!(pkg.check, CheckState::Checked);
             walk(&pkg.children);
         }
+    }
+
+    #[test]
+    fn hidden_file_leaves_render_unchecked() {
+        // A file id that's in the hide set must surface as Unchecked at the
+        // leaf level; siblings outside the hide set keep their Checked
+        // state. Parent rows stay Checked in this slice — tristate/cascade
+        // for packages and folders lands in #23.
+        let (g, idx) = build_fixture();
+        let mut hidden: HashSet<NodeId> = HashSet::new();
+        hidden.insert("packages/alpha/src/a.ts".to_string());
+        hidden.insert("packages/gamma/utils/helper.ts".to_string());
+        let tree = PackageTree::build(&g, &idx, &hidden);
+
+        // Walk to alpha's a.ts leaf and assert it's Unchecked; b.ts (not
+        // hidden) stays Checked.
+        let alpha = &tree.packages[0];
+        let a = match &alpha.children[0] {
+            FolderChild::File(f) => f,
+            _ => panic!("expected a.ts at alpha.children[0]"),
+        };
+        let b = match &alpha.children[1] {
+            FolderChild::File(f) => f,
+            _ => panic!("expected b.ts at alpha.children[1]"),
+        };
+        assert_eq!(a.check, CheckState::Unchecked);
+        assert_eq!(b.check, CheckState::Checked);
+
+        // Deep: gamma/utils/helper.ts is Unchecked inside its folder.
+        let gamma = tree
+            .packages
+            .iter()
+            .find(|p| p.name == "gamma")
+            .expect("gamma present");
+        let utils = match &gamma.children[1] {
+            FolderChild::Folder(f) => f,
+            _ => panic!("expected utils folder"),
+        };
+        let helper = match &utils.children[0] {
+            FolderChild::File(f) => f,
+            _ => panic!("expected helper.ts leaf"),
+        };
+        assert_eq!(helper.check, CheckState::Unchecked);
+
+        // Parents stay Checked pending #23.
+        assert_eq!(alpha.check, CheckState::Checked);
+        assert_eq!(utils.check, CheckState::Checked);
     }
 
     #[test]

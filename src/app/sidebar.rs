@@ -141,11 +141,16 @@ impl GruffApp {
         ui.heading("Packages");
         ui.add_space(4.0);
 
-        // Rebuild on every frame from the live graph + package color map.
-        // The tree is cheap (one pass over nodes) and staying stateless
-        // keeps the renderer in sync with incremental indexer diffs without
-        // an explicit invalidation hook.
-        let tree = PackageTree::build(&self.graph, &self.package_indices);
+        // Rebuild on every frame from the live graph + package color map +
+        // current filter. The tree is cheap (one pass over nodes) and
+        // staying stateless keeps the renderer in sync with incremental
+        // indexer diffs and toggle-driven state changes without an explicit
+        // invalidation hook.
+        let tree = PackageTree::build(
+            &self.graph,
+            &self.package_indices,
+            self.filter_state.hidden(),
+        );
         if tree.is_empty() {
             ui.label(
                 egui::RichText::new("(no packages)")
@@ -154,6 +159,12 @@ impl GruffApp {
             );
             return;
         }
+
+        // Collect file-checkbox toggles emitted by the renderer this frame.
+        // Applied after the ScrollArea closes so the filter-change flow
+        // (layout resync, cycle recompute, camera tween) runs with a fully
+        // consistent view of user intent rather than mid-render.
+        let mut toggles: Vec<NodeId> = Vec::new();
 
         // Cap the pane's rendered height so a huge package list doesn't
         // push Cycles off-screen — matches the ScrollArea policy used for
@@ -164,15 +175,17 @@ impl GruffApp {
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 for pkg in &tree.packages {
-                    draw_package_node(ui, pkg);
+                    draw_package_node(ui, pkg, &mut toggles);
                 }
                 if !tree.unpackaged.files.is_empty() {
-                    draw_unpackaged_bucket(ui, &tree.unpackaged);
+                    draw_unpackaged_bucket(ui, &tree.unpackaged, &mut toggles);
                 }
                 if !tree.externals.externals.is_empty() {
                     draw_externals_bucket(ui, &tree.externals);
                 }
             });
+
+        self.toggle_file_visibility(&toggles);
     }
 
     fn draw_cycles_pane(&mut self, ui: &mut egui::Ui) {
@@ -222,10 +235,11 @@ impl GruffApp {
 }
 
 /// Render a single workspace-package subtree. The header row combines the
-/// collapsing disclosure triangle, the inert checkbox, the color swatch,
-/// and the package name; the body holds nested folders and files.
-/// Collapsed by default per the issue's acceptance criteria.
-fn draw_package_node(ui: &mut egui::Ui, pkg: &PackageNode) {
+/// collapsing disclosure triangle, the package-level checkbox (still inert
+/// pending #23), the color swatch, and the package name; the body holds
+/// nested folders and files. Collapsed by default per the issue's
+/// acceptance criteria. File checkbox toggles bubble up through `toggles`.
+fn draw_package_node(ui: &mut egui::Ui, pkg: &PackageNode, toggles: &mut Vec<NodeId>) {
     let id = ui.make_persistent_id(format!("pkg-tree:pkg:{}", pkg.name));
     let state = egui::collapsing_header::CollapsingState::load_with_default_open(
         ui.ctx(),
@@ -235,34 +249,50 @@ fn draw_package_node(ui: &mut egui::Ui, pkg: &PackageNode) {
     let check_id = format!("pkg-check:{}", pkg.name);
     state
         .show_header(ui, |ui| {
-            draw_check(ui, &check_id, pkg.check);
+            // Package-level checkbox is still inert in this slice —
+            // tristate/cascade behavior is deferred to #23. We ignore any
+            // flip the user makes so the rendered state keeps matching
+            // what `PackageTree::build` said it should be.
+            draw_inert_check(ui, &check_id, pkg.check);
             draw_color_swatch(ui, pkg.color_index);
             ui.label(egui::RichText::new(&pkg.name).monospace());
         })
         .body(|ui| {
             let salt = format!("pkg:{}", pkg.name);
             for child in &pkg.children {
-                draw_folder_child(ui, child, &salt);
+                draw_folder_child(ui, child, &salt, toggles);
             }
         });
 }
 
 /// Render one child of a folder — either a nested folder (collapsible) or a
 /// file leaf row.
-fn draw_folder_child(ui: &mut egui::Ui, child: &FolderChild, parent_salt: &str) {
+fn draw_folder_child(
+    ui: &mut egui::Ui,
+    child: &FolderChild,
+    parent_salt: &str,
+    toggles: &mut Vec<NodeId>,
+) {
     match child {
-        FolderChild::Folder(folder) => draw_folder_node(ui, folder, parent_salt),
+        FolderChild::Folder(folder) => draw_folder_node(ui, folder, parent_salt, toggles),
         FolderChild::File(file) => {
             let id = format!("{parent_salt}:file:{}", file.id);
             ui.horizontal(|ui| {
-                draw_check(ui, &id, file.check);
+                if draw_live_check(ui, &id, file.check) {
+                    toggles.push(file.id.clone());
+                }
                 ui.label(egui::RichText::new(&file.label).monospace().small());
             });
         }
     }
 }
 
-fn draw_folder_node(ui: &mut egui::Ui, folder: &FolderNode, parent_salt: &str) {
+fn draw_folder_node(
+    ui: &mut egui::Ui,
+    folder: &FolderNode,
+    parent_salt: &str,
+    toggles: &mut Vec<NodeId>,
+) {
     let salt = format!("{parent_salt}:folder:{}", folder.name);
     let id = ui.make_persistent_id(format!("pkg-tree:{salt}"));
     let state = egui::collapsing_header::CollapsingState::load_with_default_open(
@@ -273,17 +303,22 @@ fn draw_folder_node(ui: &mut egui::Ui, folder: &FolderNode, parent_salt: &str) {
     let check_id = format!("{salt}:check");
     state
         .show_header(ui, |ui| {
-            draw_check(ui, &check_id, folder.check);
+            // Folder-level checkbox stays inert pending #23.
+            draw_inert_check(ui, &check_id, folder.check);
             ui.label(egui::RichText::new(&folder.name).monospace());
         })
         .body(|ui| {
             for child in &folder.children {
-                draw_folder_child(ui, child, &salt);
+                draw_folder_child(ui, child, &salt, toggles);
             }
         });
 }
 
-fn draw_unpackaged_bucket(ui: &mut egui::Ui, bucket: &UnpackagedBucket) {
+fn draw_unpackaged_bucket(
+    ui: &mut egui::Ui,
+    bucket: &UnpackagedBucket,
+    toggles: &mut Vec<NodeId>,
+) {
     let salt = "unpackaged";
     let id = ui.make_persistent_id("pkg-tree:unpackaged");
     let state = egui::collapsing_header::CollapsingState::load_with_default_open(
@@ -293,14 +328,17 @@ fn draw_unpackaged_bucket(ui: &mut egui::Ui, bucket: &UnpackagedBucket) {
     );
     state
         .show_header(ui, |ui| {
-            draw_check(ui, "unpackaged:check", bucket.check);
+            // Bucket-level checkbox inert pending #23.
+            draw_inert_check(ui, "unpackaged:check", bucket.check);
             ui.label(egui::RichText::new(UNPACKAGED_LABEL).italics());
         })
         .body(|ui| {
             for file in &bucket.files {
                 let id = format!("{salt}:file:{}", file.id);
                 ui.horizontal(|ui| {
-                    draw_check(ui, &id, file.check);
+                    if draw_live_check(ui, &id, file.check) {
+                        toggles.push(file.id.clone());
+                    }
                     ui.label(egui::RichText::new(&file.label).monospace().small());
                 });
             }
@@ -317,31 +355,49 @@ fn draw_externals_bucket(ui: &mut egui::Ui, bucket: &ExternalsBucket) {
     );
     state
         .show_header(ui, |ui| {
-            draw_check(ui, "externals:check", bucket.check);
+            // Externals bucket + each external leaf are still inert in this
+            // slice. Per the issue, #22 wires *file-level* checkboxes only;
+            // externals aren't workspace files and don't enter the
+            // file-level hide path.
+            draw_inert_check(ui, "externals:check", bucket.check);
             ui.label(egui::RichText::new(EXTERNALS_LABEL).italics());
         })
         .body(|ui| {
             for ext in &bucket.externals {
                 let id = format!("{salt}:ext:{}", ext.id);
                 ui.horizontal(|ui| {
-                    draw_check(ui, &id, ext.check);
+                    draw_inert_check(ui, &id, ext.check);
                     ui.label(egui::RichText::new(&ext.label).monospace().small());
                 });
             }
         });
 }
 
-/// Render a checkbox bound to a local so egui draws it interactively. The
-/// flip is ignored for now — visibility semantics land in #22. `CheckState`
-/// maps to a bool with `Mixed` biased to `true` so a tristate parent still
-/// reads as "mostly on".
-fn draw_check(ui: &mut egui::Ui, id: &str, state: CheckState) {
+/// Render a checkbox that forwards user clicks to the caller. Returns
+/// `true` on the frame where the user toggled it — the caller appends the
+/// corresponding node id to a pending-toggles batch and applies the change
+/// once the frame's UI tree finishes walking.
+fn draw_live_check(ui: &mut egui::Ui, id: &str, state: CheckState) -> bool {
+    let mut checked = matches!(state, CheckState::Checked | CheckState::Mixed);
+    let mut toggled = false;
+    ui.scope(|ui| {
+        ui.push_id(id, |ui| {
+            if ui.checkbox(&mut checked, "").changed() {
+                toggled = true;
+            }
+        });
+    });
+    toggled
+}
+
+/// Render a checkbox whose flip is intentionally ignored — used for
+/// package/folder/bucket rows pending tristate cascade in #23. The widget
+/// still draws interactively so the user can click it without the app
+/// reacting, matching the original "visible but inert" UX.
+fn draw_inert_check(ui: &mut egui::Ui, id: &str, state: CheckState) {
     let mut checked = !matches!(state, CheckState::Unchecked);
     ui.scope(|ui| {
         ui.push_id(id, |ui| {
-            // Bind to a throwaway `bool` — toggling doesn't persist. Makes
-            // the widget interactive so the user can still click it without
-            // the app reacting (per "visible but inert" in the issue).
             let _ = ui.checkbox(&mut checked, "");
         });
     });

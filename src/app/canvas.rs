@@ -88,8 +88,11 @@ impl GruffApp {
     }
 
     /// Fit the camera to every visible node's bounding box. Used by the
-    /// initial folder-load fit (snap) and the `F` shortcut (tween). A layout
-    /// with no positions is a no-op — there's nothing meaningful to fit to.
+    /// initial folder-load fit (snap), the `F` shortcut (tween), and the
+    /// filter-change flow (tween). A layout with no positions is a no-op —
+    /// there's nothing meaningful to fit to. Layout already omits hidden
+    /// nodes after `apply_filter_change`, so iterating its positions yields
+    /// the visible-subgraph bbox directly.
     fn fit_all(&mut self, rect: egui::Rect, mode: FitMode) {
         let Some(bbox) = Bbox::from_points(self.layout.iter().map(|(_, p)| p)) else {
             return;
@@ -160,6 +163,17 @@ impl GruffApp {
     ) -> Option<(NodeId, NodeId)> {
         let mut best: Option<(f32, (NodeId, NodeId))> = None;
         for edge in &self.graph.edges {
+            // Edges with a hidden endpoint are out of the visible subgraph
+            // entirely — skip them in hit-testing so a stray click near a
+            // phantom line doesn't select something that isn't drawn.
+            // `layout.get` also returns `None` for hidden nodes (they were
+            // removed by `resync_layout`), which is already enough to skip,
+            // but being explicit matches the render loop below.
+            if self.filter_state.is_hidden(&edge.from)
+                || self.filter_state.is_hidden(&edge.to)
+            {
+                continue;
+            }
             let (Some(pa), Some(pb)) = (self.layout.get(&edge.from), self.layout.get(&edge.to))
             else {
                 continue;
@@ -325,8 +339,18 @@ impl GruffApp {
             .filter(|s| !s.input.trim().is_empty())
             .map(|s| &s.matches);
 
-        // Edges first so nodes overlap them.
+        // Edges first so nodes overlap them. Edges with any hidden endpoint
+        // drop out of rendering entirely — PRD #16's "no dashed short-
+        // circuit edges" rule. `layout.get` already returns `None` for
+        // hidden nodes, but checking the filter first makes the intent
+        // explicit and avoids allocating a position that we'd immediately
+        // throw away.
         for edge in &self.graph.edges {
+            if self.filter_state.is_hidden(&edge.from)
+                || self.filter_state.is_hidden(&edge.to)
+            {
+                continue;
+            }
             let (Some(pa), Some(pb)) = (self.layout.get(&edge.from), self.layout.get(&edge.to))
             else {
                 continue;
