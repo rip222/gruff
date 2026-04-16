@@ -7,7 +7,7 @@ use eframe::egui;
 use crate::colors;
 use crate::config::{self, Config};
 use crate::editor::{self, OpenError};
-use crate::graph::{Graph, NodeId};
+use crate::graph::{Graph, NodeId, NodeKind};
 use crate::indexer::index_folder;
 use crate::layout::{Layout, Vec2};
 
@@ -220,12 +220,16 @@ impl GruffApp {
         )
     }
 
-    /// Color for an unselected node. Workspace files take their owning
-    /// package's color; files outside every package fall back to [`colors::NODE`].
+    /// Color for an unselected node. External leaves render neutral gray so
+    /// `node_modules` packages read as "not our code" at a glance; workspace
+    /// files take their owning package's color; fallbacks use [`colors::NODE`].
     fn node_color(&self, id: &NodeId) -> egui::Color32 {
         let Some(node) = self.graph.nodes.get(id) else {
             return colors::NODE;
         };
+        if node.kind == NodeKind::External {
+            return colors::EXTERNAL_NODE;
+        }
         let Some(pkg) = node.package.as_deref() else {
             return colors::NODE;
         };
@@ -497,11 +501,19 @@ impl GruffApp {
         };
         // Snapshot owned copies of the fields we need so `self` stays free for
         // `&mut` calls (editor prompt, frame requests) below.
-        let Some((display_id, on_disk_path, package)) = self
+        let Some((display_id, display_label, on_disk_path, package, kind)) = self
             .graph
             .nodes
             .get(&selected)
-            .map(|n| (n.id.clone(), n.path.clone(), n.package.clone()))
+            .map(|n| {
+                (
+                    n.id.clone(),
+                    n.label.clone(),
+                    n.path.clone(),
+                    n.package.clone(),
+                    n.kind,
+                )
+            })
         else {
             // Selection stale (node removed) — clear it silently next frame.
             self.selected = None;
@@ -509,24 +521,36 @@ impl GruffApp {
         };
 
         ui.add_space(6.0);
-        ui.heading("Selected file");
+        match kind {
+            NodeKind::File => ui.heading("Selected file"),
+            NodeKind::External => ui.heading("External dependency"),
+            NodeKind::WorkspacePackage => ui.heading("Workspace package"),
+        };
         ui.add_space(4.0);
 
-        ui.label(egui::RichText::new("Path").color(colors::HINT).small());
-        // Clickable path — launches the user's configured editor. The actual
-        // path on disk is what we hand the editor, but we show the workspace-
-        // relative node id in the UI so it stays short.
-        let link = ui
-            .add(
-                egui::Label::new(egui::RichText::new(&display_id).monospace().underline())
-                    .sense(egui::Sense::click()),
-            )
-            .on_hover_text("Click to open in your editor");
-        if link.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        if link.clicked() {
-            self.try_open_in_editor(on_disk_path);
+        if matches!(kind, NodeKind::External | NodeKind::WorkspacePackage) {
+            // Synthetic nodes have no on-disk file — render just the package
+            // name. Skip the "open in editor" affordance so we don't launch
+            // an editor on a non-existent path.
+            ui.label(egui::RichText::new("Package").color(colors::HINT).small());
+            ui.label(egui::RichText::new(&display_label).monospace());
+        } else {
+            ui.label(egui::RichText::new("Path").color(colors::HINT).small());
+            // Clickable path — launches the user's configured editor. The actual
+            // path on disk is what we hand the editor, but we show the workspace-
+            // relative node id in the UI so it stays short.
+            let link = ui
+                .add(
+                    egui::Label::new(egui::RichText::new(&display_id).monospace().underline())
+                        .sense(egui::Sense::click()),
+                )
+                .on_hover_text("Click to open in your editor");
+            if link.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if link.clicked() {
+                self.try_open_in_editor(on_disk_path);
+            }
         }
 
         ui.add_space(8.0);

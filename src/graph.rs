@@ -3,6 +3,22 @@ use std::path::PathBuf;
 
 pub type NodeId = String;
 
+/// Distinguishes first-party source files from the synthetic nodes the indexer
+/// adds to represent cross-package boundaries. Used by the renderer to pick a
+/// color (external = neutral gray) and by tests to assert structural shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeKind {
+    /// Workspace source file (the default file-level node).
+    File,
+    /// Synthetic aggregator node for a workspace package — the source endpoint
+    /// of every aggregated edge into external packages. One per package that
+    /// actually imports externals.
+    WorkspacePackage,
+    /// Leaf representing a `node_modules` dependency by package name only. One
+    /// per distinct external package across the whole graph.
+    External,
+}
+
 #[derive(Debug, Clone)]
 pub struct Node {
     pub id: NodeId,
@@ -10,8 +26,12 @@ pub struct Node {
     pub label: String,
     /// Name of the workspace package that owns this file, if any. `None` means
     /// the node isn't attributed to a package (e.g. stray file outside every
-    /// workspace package). Set by the indexer from [`crate::workspace::Workspace`].
+    /// workspace package, or an external leaf). Set by the indexer from
+    /// [`crate::workspace::Workspace`].
     pub package: Option<String>,
+    /// Kind discriminator. Defaults to [`NodeKind::File`] for pre-existing
+    /// call sites that construct `Node` literally.
+    pub kind: NodeKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +214,7 @@ mod tests {
             path: PathBuf::from(id),
             label: id.to_string(),
             package: None,
+            kind: NodeKind::File,
         }
     }
 

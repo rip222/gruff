@@ -535,7 +535,7 @@ fn quadrant(p: Vec2, cx: f32, cy: f32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::Node;
+    use crate::graph::{Node, NodeKind};
     use std::path::PathBuf;
 
     fn n(id: &str) -> Node {
@@ -544,6 +544,7 @@ mod tests {
             path: PathBuf::from(id),
             label: id.to_string(),
             package: None,
+            kind: NodeKind::File,
         }
     }
 
@@ -553,6 +554,7 @@ mod tests {
             path: PathBuf::from(id),
             label: id.to_string(),
             package: Some(pkg.to_string()),
+            kind: NodeKind::File,
         }
     }
 
