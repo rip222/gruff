@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::graph::{Graph, Node, NodeKind};
-use crate::parser::parse_file_imports;
-use crate::resolver::{resolve, ResolvedImport};
+use crate::parser::{parse_file_imports, ImportKind};
+use crate::resolver::{resolve_import, ResolvedImport, ResolverContext};
 use crate::workspace::Workspace;
 
 const SOURCE_EXTS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs"];
@@ -29,18 +29,33 @@ pub fn workspace_package_node_id(name: &str) -> String {
     format!("{WORKSPACE_PKG_ID_PREFIX}{name}")
 }
 
+/// Output of an indexing pass: the file-level dependency graph plus index-time
+/// metadata the UI needs (currently the count of fully-unresolvable dynamic
+/// imports, surfaced in the status bar).
+#[derive(Debug, Default)]
+pub struct IndexResult {
+    pub graph: Graph,
+    /// Number of `import(...)` calls whose source couldn't be statically
+    /// determined (e.g. `import(modName)`). Reported in the status bar so the
+    /// user knows the graph isn't showing those edges.
+    pub unresolved_dynamic: usize,
+}
+
 /// Scan `root` into a `Workspace`, then index every JS/TS file under it.
 /// This is the entry point the app uses when the user drops a folder.
-pub fn index_folder(root: &Path) -> Graph {
+pub fn index_folder(root: &Path) -> IndexResult {
     let ws = Workspace::discover(root);
     index_workspace(&ws)
 }
 
-/// Walk the workspace, parse every JS/TS file, resolve relative imports, and
-/// build a file-level dependency graph with each node tagged by its owning
-/// package. Respects the workspace's `.gitignore`-aware matcher.
-pub fn index_workspace(ws: &Workspace) -> Graph {
+/// Walk the workspace, parse every JS/TS file, resolve every import (static,
+/// require, dynamic, re-export), and build a file-level dependency graph with
+/// each node tagged by its owning package. Respects the workspace's
+/// `.gitignore`-aware matcher.
+pub fn index_workspace(ws: &Workspace) -> IndexResult {
     let mut graph = Graph::new();
+    let ctx = ResolverContext::build(ws);
+    let mut unresolved_dynamic: usize = 0;
 
     let mut files: Vec<PathBuf> = Vec::new();
     for entry in WalkDir::new(&ws.root)
@@ -110,64 +125,92 @@ pub fn index_workspace(ws: &Workspace) -> Graph {
             .flatten();
 
         for imp in parse_file_imports(&from_canonical) {
-            match resolve(&from_canonical, &imp.source) {
-                ResolvedImport::WorkspaceFile(target) => {
-                    let resolved_canonical = target.canonicalize().unwrap_or(target);
-                    if let Some(to_id) = id_by_path.get(&resolved_canonical) {
-                        graph.add_edge(&from_id, to_id);
-                    }
+            let results = resolve_import(&ctx, ws, &from_canonical, &imp);
+
+            // A `Dynamic` import whose source can't be statically pinned down
+            // produces an empty result vec. Count it once and move on so the
+            // status bar can surface the missing-edge total.
+            if results.is_empty() {
+                if imp.kind == ImportKind::Dynamic {
+                    unresolved_dynamic += 1;
                 }
-                ResolvedImport::External(pkg_name) => {
-                    // Source endpoint: the workspace-package aggregator. Fall
-                    // back to a stable synthetic name when the file isn't
-                    // attributed to any package so orphaned imports still get
-                    // aggregated (and don't fan out to the external node).
-                    let source_pkg = owning_pkg
-                        .clone()
-                        .unwrap_or_else(|| "(unattributed)".to_string());
+                continue;
+            }
 
-                    let ext_id = external_node_id(&pkg_name);
-                    if external_added.insert(pkg_name.clone()) {
-                        graph.add_node(Node {
-                            id: ext_id.clone(),
-                            // Externals don't have an on-disk path we care
-                            // about — use the bare package name as a marker so
-                            // the editor-open affordance doesn't try to cd
-                            // into node_modules.
-                            path: PathBuf::from(&pkg_name),
-                            label: pkg_name.clone(),
-                            // Externals don't belong to a workspace package;
-                            // leaving this `None` also keeps them out of the
-                            // layout's clustering force.
-                            package: None,
-                            kind: NodeKind::External,
-                        });
-                    }
+            // Track whether at least one result for this dynamic import landed
+            // somewhere usable. If every result is `Unresolved`, the dynamic
+            // import contributed no edges and should be counted.
+            let mut produced_edge = false;
 
-                    let ws_pkg_id = workspace_package_node_id(&source_pkg);
-                    if workspace_pkg_added.insert(source_pkg.clone()) {
-                        graph.add_node(Node {
-                            id: ws_pkg_id.clone(),
-                            path: PathBuf::from(&source_pkg),
-                            label: source_pkg.clone(),
-                            // Tag the aggregator with its own package name so
-                            // the layout's clustering force pulls it into the
-                            // same cluster as its files.
-                            package: Some(source_pkg.clone()),
-                            kind: NodeKind::WorkspacePackage,
-                        });
+            for resolved in results {
+                match resolved {
+                    ResolvedImport::WorkspaceFile(target) => {
+                        let resolved_canonical = target.canonicalize().unwrap_or(target);
+                        if let Some(to_id) = id_by_path.get(&resolved_canonical) {
+                            graph.add_edge(&from_id, to_id);
+                            produced_edge = true;
+                        }
                     }
+                    ResolvedImport::External(pkg_name) => {
+                        // Source endpoint: the workspace-package aggregator. Fall
+                        // back to a stable synthetic name when the file isn't
+                        // attributed to any package so orphaned imports still get
+                        // aggregated (and don't fan out to the external node).
+                        let source_pkg = owning_pkg
+                            .clone()
+                            .unwrap_or_else(|| "(unattributed)".to_string());
 
-                    if aggregated_edges.insert((source_pkg.clone(), pkg_name.clone())) {
-                        graph.add_edge(&ws_pkg_id, &ext_id);
+                        let ext_id = external_node_id(&pkg_name);
+                        if external_added.insert(pkg_name.clone()) {
+                            graph.add_node(Node {
+                                id: ext_id.clone(),
+                                // Externals don't have an on-disk path we care
+                                // about — use the bare package name as a marker so
+                                // the editor-open affordance doesn't try to cd
+                                // into node_modules.
+                                path: PathBuf::from(&pkg_name),
+                                label: pkg_name.clone(),
+                                // Externals don't belong to a workspace package;
+                                // leaving this `None` also keeps them out of the
+                                // layout's clustering force.
+                                package: None,
+                                kind: NodeKind::External,
+                            });
+                        }
+
+                        let ws_pkg_id = workspace_package_node_id(&source_pkg);
+                        if workspace_pkg_added.insert(source_pkg.clone()) {
+                            graph.add_node(Node {
+                                id: ws_pkg_id.clone(),
+                                path: PathBuf::from(&source_pkg),
+                                label: source_pkg.clone(),
+                                // Tag the aggregator with its own package name so
+                                // the layout's clustering force pulls it into the
+                                // same cluster as its files.
+                                package: Some(source_pkg.clone()),
+                                kind: NodeKind::WorkspacePackage,
+                            });
+                        }
+
+                        if aggregated_edges.insert((source_pkg.clone(), pkg_name.clone())) {
+                            graph.add_edge(&ws_pkg_id, &ext_id);
+                        }
+                        produced_edge = true;
                     }
+                    ResolvedImport::Unresolved => {}
                 }
-                ResolvedImport::Unresolved => {}
+            }
+
+            if !produced_edge && imp.kind == ImportKind::Dynamic {
+                unresolved_dynamic += 1;
             }
         }
     }
 
-    graph
+    IndexResult {
+        graph,
+        unresolved_dynamic,
+    }
 }
 
 #[cfg(test)]
@@ -182,7 +225,7 @@ mod tests {
         fs::write(dir.path().join("a.ts"), r#"import { b } from "./b";"#).unwrap();
         fs::write(dir.path().join("b.ts"), "export const b = 1;").unwrap();
 
-        let g = index_folder(dir.path());
+        let g = index_folder(dir.path()).graph;
         assert_eq!(g.nodes.len(), 2);
         assert_eq!(g.edges.len(), 1);
     }
@@ -194,7 +237,7 @@ mod tests {
         fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
         fs::write(dir.path().join("node_modules/pkg/index.js"), "").unwrap();
 
-        let g = index_folder(dir.path());
+        let g = index_folder(dir.path()).graph;
         assert_eq!(g.nodes.len(), 1);
     }
 
@@ -221,7 +264,7 @@ mod tests {
         )
         .unwrap();
 
-        let g = index_folder(dir.path());
+        let g = index_folder(dir.path()).graph;
 
         let ext_id = external_node_id("react");
         let react_nodes: Vec<_> = g
@@ -265,7 +308,7 @@ mod tests {
         )
         .unwrap();
 
-        let g = index_folder(dir.path());
+        let g = index_folder(dir.path()).graph;
 
         let externals: Vec<_> = g
             .nodes
@@ -325,7 +368,7 @@ mod tests {
         )
         .unwrap();
 
-        let g = index_folder(dir.path());
+        let g = index_folder(dir.path()).graph;
 
         let ext_id = external_node_id("react");
         let edges_to_react: Vec<_> = g.edges.iter().filter(|e| e.to == ext_id).collect();
@@ -346,7 +389,7 @@ mod tests {
         fs::write(dir.path().join("a.ts"), r#"import { b } from "./b";"#).unwrap();
         fs::write(dir.path().join("b.ts"), "export const b = 1;").unwrap();
 
-        let g = index_folder(dir.path());
+        let g = index_folder(dir.path()).graph;
         let has_pkg_node = g
             .nodes
             .values()
@@ -381,7 +424,7 @@ mod tests {
         fs::write(dir.path().join("packages/a/index.ts"), "").unwrap();
         fs::write(dir.path().join("packages/b/index.ts"), "").unwrap();
 
-        let g = index_folder(dir.path());
+        let g = index_folder(dir.path()).graph;
         let packages: Vec<_> = g
             .nodes
             .values()
@@ -389,5 +432,172 @@ mod tests {
             .collect();
         assert!(packages.contains(&"@org/a".to_string()));
         assert!(packages.contains(&"@org/b".to_string()));
+    }
+
+    // --- new import-mode coverage ----------------------------------------
+
+    #[test]
+    fn require_creates_workspace_edge() {
+        // CommonJS `require("./b")` must produce the same edge as the static
+        // ES form — the graph is module-style agnostic.
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("a.js"),
+            r#"const b = require("./b");"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("b.js"), "module.exports = 1;").unwrap();
+
+        let g = index_folder(dir.path()).graph;
+        assert_eq!(g.nodes.len(), 2);
+        assert_eq!(g.edges.len(), 1);
+    }
+
+    #[test]
+    fn re_export_creates_workspace_edge() {
+        // Barrel files (`export * from './foo'`) appear as legitimate
+        // intermediaries in the graph — the re-export hop is an edge.
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("index.ts"),
+            r#"export * from "./foo";"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("foo.ts"), "export const x = 1;").unwrap();
+
+        let g = index_folder(dir.path()).graph;
+        assert_eq!(g.edges.len(), 1);
+        assert!(g
+            .edges
+            .iter()
+            .any(|e| e.from == "index.ts" && e.to == "foo.ts"));
+    }
+
+    #[test]
+    fn dynamic_import_string_creates_workspace_edge() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("a.ts"),
+            r#"const b = import("./b");"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("b.ts"), "export const x = 1;").unwrap();
+
+        let result = index_folder(dir.path());
+        assert_eq!(result.graph.edges.len(), 1);
+        assert_eq!(result.unresolved_dynamic, 0);
+    }
+
+    #[test]
+    fn template_prefix_dynamic_import_creates_one_edge_per_locale() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("loader.ts"),
+            r#"const x = import(`./locales/${l}`);"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("locales")).unwrap();
+        fs::write(dir.path().join("locales/en.ts"), "").unwrap();
+        fs::write(dir.path().join("locales/fr.ts"), "").unwrap();
+        fs::write(dir.path().join("locales/de.ts"), "").unwrap();
+
+        let result = index_folder(dir.path());
+        let edges_from_loader: Vec<_> = result
+            .graph
+            .edges
+            .iter()
+            .filter(|e| e.from == "loader.ts")
+            .collect();
+        assert_eq!(edges_from_loader.len(), 3);
+        assert_eq!(result.unresolved_dynamic, 0);
+    }
+
+    #[test]
+    fn truly_dynamic_import_counted_in_status() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("a.ts"),
+            r#"const m = import(modName);"#,
+        )
+        .unwrap();
+        let result = index_folder(dir.path());
+        assert_eq!(result.unresolved_dynamic, 1);
+        // No bogus edges from the unresolvable import.
+        assert!(result.graph.edges.is_empty());
+    }
+
+    #[test]
+    fn tsconfig_paths_alias_resolves_to_workspace_file() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"root"}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("tsconfig.json"),
+            r#"{
+                "compilerOptions": {
+                    "baseUrl": ".",
+                    "paths": { "@myorg/shared/*": ["packages/shared/src/*"] }
+                }
+            }"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("packages/shared/src")).unwrap();
+        fs::write(dir.path().join("packages/shared/src/utils.ts"), "").unwrap();
+        fs::create_dir_all(dir.path().join("apps/web/src")).unwrap();
+        fs::write(
+            dir.path().join("apps/web/src/index.ts"),
+            r#"import { x } from "@myorg/shared/utils";"#,
+        )
+        .unwrap();
+
+        let g = index_folder(dir.path()).graph;
+        // An edge from apps/web/src/index.ts → packages/shared/src/utils.ts
+        // confirms the alias resolved through the root tsconfig.
+        let has_alias_edge = g
+            .edges
+            .iter()
+            .any(|e| e.from.ends_with("apps/web/src/index.ts")
+                && e.to.ends_with("packages/shared/src/utils.ts"));
+        assert!(has_alias_edge, "missing alias edge in {:?}", g.edges);
+    }
+
+    #[test]
+    fn workspace_package_name_resolves_to_entry_file() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("yarn.lock"), "").unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"root","workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("packages/shared/src")).unwrap();
+        fs::write(
+            dir.path().join("packages/shared/package.json"),
+            r#"{"name":"@org/shared","main":"src/index.ts"}"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("packages/shared/src/index.ts"), "").unwrap();
+        fs::create_dir_all(dir.path().join("packages/web/src")).unwrap();
+        fs::write(
+            dir.path().join("packages/web/package.json"),
+            r#"{"name":"@org/web"}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("packages/web/src/main.ts"),
+            r#"import { x } from "@org/shared";"#,
+        )
+        .unwrap();
+
+        let g = index_folder(dir.path()).graph;
+        let has_ws_edge = g
+            .edges
+            .iter()
+            .any(|e| e.from.ends_with("packages/web/src/main.ts")
+                && e.to.ends_with("packages/shared/src/index.ts"));
+        assert!(has_ws_edge, "missing workspace edge in {:?}", g.edges);
     }
 }

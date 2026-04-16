@@ -59,6 +59,10 @@ pub struct GruffApp {
     zoom: f32,
     sim_enabled: bool,
     status: String,
+    /// Count of fully-unresolvable dynamic imports (e.g. `import(modName)`)
+    /// found during the last index. Surfaced in the status bar when nonzero
+    /// so users know the graph isn't showing those edges.
+    unresolved_dynamic: usize,
     /// User settings loaded from `~/.gruff/config.toml`. Mutated when the user
     /// picks an editor through the modal; persisted immediately on change.
     config: Config,
@@ -82,6 +86,7 @@ impl Default for GruffApp {
             zoom: 1.0,
             sim_enabled: true,
             status: String::new(),
+            unresolved_dynamic: 0,
             config: config::load(),
             editor_prompt: None,
         }
@@ -91,7 +96,9 @@ impl Default for GruffApp {
 impl GruffApp {
     fn load_folder(&mut self, path: PathBuf) {
         let start = Instant::now();
-        self.graph = index_folder(&path);
+        let result = index_folder(&path);
+        self.graph = result.graph;
+        self.unresolved_dynamic = result.unresolved_dynamic;
 
         // Precompute adjacency lists once per load so hit-test + sidebar
         // rendering don't iterate all edges per frame. Sorted for stable UI.
@@ -159,7 +166,7 @@ impl GruffApp {
         self.camera = Vec2::new(0.0, 0.0);
         self.zoom = 1.0;
         self.sim_enabled = true;
-        self.status = format!(
+        let mut status = format!(
             "{} files, {} edges, {} cycle{} — indexed in {:.2}s",
             self.graph.nodes.len(),
             self.graph.edges.len(),
@@ -167,6 +174,16 @@ impl GruffApp {
             if self.cycles.len() == 1 { "" } else { "s" },
             start.elapsed().as_secs_f32(),
         );
+        if self.unresolved_dynamic > 0 {
+            // Append rather than overwrite so the user still sees indexing
+            // metrics; the dynamic-imports note is supplementary context.
+            status.push_str(&format!(
+                "  ·  {} unresolved dynamic import{}",
+                self.unresolved_dynamic,
+                if self.unresolved_dynamic == 1 { "" } else { "s" },
+            ));
+        }
+        self.status = status;
     }
 
     /// True when this edge lies inside a cyclic SCC. An edge `(u,v)` is on a

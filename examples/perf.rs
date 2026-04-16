@@ -1,4 +1,4 @@
-use gruff::graph::{Graph, Node};
+use gruff::graph::{Graph, Node, NodeKind};
 use gruff::layout::Layout;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -12,6 +12,7 @@ fn main() {
                 path: PathBuf::new(),
                 label: String::new(),
                 package: None,
+                kind: NodeKind::File,
             });
         }
         // sprinkle edges — roughly 2 per node
