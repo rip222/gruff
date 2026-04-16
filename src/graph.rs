@@ -8,6 +8,10 @@ pub struct Node {
     pub id: NodeId,
     pub path: PathBuf,
     pub label: String,
+    /// Name of the workspace package that owns this file, if any. `None` means
+    /// the node isn't attributed to a package (e.g. stray file outside every
+    /// workspace package). Set by the indexer from [`crate::workspace::Workspace`].
+    pub package: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +79,7 @@ mod tests {
             id: id.to_string(),
             path: PathBuf::from(id),
             label: id.to_string(),
+            package: None,
         }
     }
 

@@ -51,6 +51,12 @@ pub struct Layout {
     velocities: Vec<Vec2>,
     edge_pairs: Vec<(usize, usize)>,
     tree: QuadTree,
+    /// Per-node group index (usually workspace-package id). `None` = ungrouped.
+    /// Parallel to `positions`.
+    groups: Vec<Option<u32>>,
+    /// Number of distinct groups in `groups` (max(group) + 1). Cached so the
+    /// per-step aggregation doesn't re-scan to size its buffers.
+    group_count: usize,
     pub k: f32,
     pub gravity: f32,
     pub damping: f32,
@@ -58,6 +64,10 @@ pub struct Layout {
     /// Barnes-Hut approximation threshold. Higher = faster, less accurate.
     /// Typical range 0.5–1.2. Values ≤ 0 disable the approximation entirely.
     pub theta: f32,
+    /// Strength of the centroid-pull that clusters files in the same package.
+    /// 0 disables clustering entirely. Typical values are small (0.01–0.05)
+    /// because the force is multiplied by `k` and distance-from-centroid.
+    pub cluster_strength: f32,
 }
 
 impl Default for Layout {
@@ -75,11 +85,14 @@ impl Layout {
             velocities: Vec::new(),
             edge_pairs: Vec::new(),
             tree: QuadTree::new(),
+            groups: Vec::new(),
+            group_count: 0,
             k: 55.0,
             gravity: 0.03,
             damping: 0.82,
             max_speed: 400.0,
             theta: 1.0,
+            cluster_strength: 0.02,
         }
     }
 
@@ -118,11 +131,16 @@ impl Layout {
         self.positions.clear();
         self.velocities.clear();
         self.edge_pairs.clear();
+        self.groups.clear();
 
         let total = graph.nodes.len().max(1) as f32;
         let mut fresh_idx = 0usize;
 
-        for id in graph.nodes.keys() {
+        // Assign a stable group id per package name seen in this sync. Files
+        // without a package get `None` and are skipped by the clustering force.
+        let mut group_of: HashMap<&str, u32> = HashMap::new();
+
+        for (id, node) in graph.nodes.iter() {
             let i = self.ids.len();
             self.ids.push(id.clone());
             self.index_of.insert(id.clone(), i);
@@ -138,7 +156,15 @@ impl Layout {
                 self.velocities.push(Vec2::default());
                 fresh_idx += 1;
             }
+
+            let group = node.package.as_deref().map(|name| {
+                let next = group_of.len() as u32;
+                *group_of.entry(name).or_insert(next)
+            });
+            self.groups.push(group);
         }
+
+        self.group_count = group_of.len();
 
         for e in &graph.edges {
             if let (Some(&i), Some(&j)) = (self.index_of.get(&e.from), self.index_of.get(&e.to)) {
@@ -188,6 +214,34 @@ impl Layout {
             forces[i].y -= fy;
             forces[j].x += fx;
             forces[j].y += fy;
+        }
+
+        // Package-aware clustering: pull each grouped node toward its group's
+        // centroid. Keeps the data model flat (no container rendering) while
+        // producing visible clusters in the force-directed layout.
+        if self.cluster_strength > 0.0 && self.group_count > 0 {
+            let mut sum = vec![Vec2::default(); self.group_count];
+            let mut count = vec![0u32; self.group_count];
+            for i in 0..n {
+                if let Some(g) = self.groups[i] {
+                    let idx = g as usize;
+                    sum[idx] = sum[idx] + self.positions[i];
+                    count[idx] += 1;
+                }
+            }
+            let gain = self.cluster_strength * k;
+            for i in 0..n {
+                if let Some(g) = self.groups[i] {
+                    let idx = g as usize;
+                    if count[idx] > 1 {
+                        let inv = 1.0 / count[idx] as f32;
+                        let cx = sum[idx].x * inv;
+                        let cy = sum[idx].y * inv;
+                        forces[i].x += (cx - self.positions[i].x) * gain;
+                        forces[i].y += (cy - self.positions[i].y) * gain;
+                    }
+                }
+            }
         }
 
         // Gravity pulling toward origin.
@@ -489,6 +543,16 @@ mod tests {
             id: id.to_string(),
             path: PathBuf::from(id),
             label: id.to_string(),
+            package: None,
+        }
+    }
+
+    fn n_in(id: &str, pkg: &str) -> Node {
+        Node {
+            id: id.to_string(),
+            path: PathBuf::from(id),
+            label: id.to_string(),
+            package: Some(pkg.to_string()),
         }
     }
 
@@ -592,6 +656,83 @@ mod tests {
         let p = layout.positions[0];
         // Gravity pulls toward origin but one step at dt=1/60 is tiny.
         assert!(p.x.is_finite() && p.y.is_finite());
+    }
+
+    #[test]
+    fn package_clustering_pulls_members_closer_together() {
+        // Two disconnected packages of four files each. With clustering off,
+        // repulsion alone leaves no affinity between same-package members;
+        // with clustering on, members of the same package drift closer
+        // together even though no edges connect them.
+        fn build() -> (Graph, Vec<Vec2>) {
+            let mut g = Graph::new();
+            for i in 0..4 {
+                g.add_node(n_in(&format!("a{i}"), "alpha"));
+            }
+            for i in 0..4 {
+                g.add_node(n_in(&format!("b{i}"), "beta"));
+            }
+            // Seed starting positions so the two packages start interleaved —
+            // clustering must actually pull them apart, not just preserve
+            // initial separation.
+            let positions = vec![
+                Vec2::new(-30.0, 0.0), // a0
+                Vec2::new(30.0, 0.0),  // a1
+                Vec2::new(0.0, -30.0), // a2
+                Vec2::new(0.0, 30.0),  // a3
+                Vec2::new(-15.0, -15.0),
+                Vec2::new(15.0, 15.0),
+                Vec2::new(-15.0, 15.0),
+                Vec2::new(15.0, -15.0),
+            ];
+            (g, positions)
+        }
+
+        fn mean_intra_package_distance(layout: &Layout, ids: &[&str]) -> f32 {
+            let ps: Vec<Vec2> = ids
+                .iter()
+                .map(|id| layout.get(id).expect("position"))
+                .collect();
+            let mut sum = 0.0;
+            let mut pairs = 0;
+            for i in 0..ps.len() {
+                for j in (i + 1)..ps.len() {
+                    sum += (ps[i] - ps[j]).length();
+                    pairs += 1;
+                }
+            }
+            sum / pairs as f32
+        }
+
+        let (g, starts) = build();
+        let mut with_clusters = Layout::new();
+        with_clusters.cluster_strength = 0.2;
+        with_clusters.sync(&g);
+        for (i, p) in starts.iter().enumerate() {
+            with_clusters.positions[i] = *p;
+        }
+
+        let mut without_clusters = Layout::new();
+        without_clusters.cluster_strength = 0.0;
+        without_clusters.sync(&g);
+        for (i, p) in starts.iter().enumerate() {
+            without_clusters.positions[i] = *p;
+        }
+
+        // Run the simulation long enough for centroid-pull to win over
+        // the per-frame velocity damping.
+        for _ in 0..240 {
+            with_clusters.step(1.0 / 60.0);
+            without_clusters.step(1.0 / 60.0);
+        }
+
+        let alpha_ids = ["a0", "a1", "a2", "a3"];
+        let tight = mean_intra_package_distance(&with_clusters, &alpha_ids);
+        let loose = mean_intra_package_distance(&without_clusters, &alpha_ids);
+        assert!(
+            tight < loose,
+            "clustered mean distance ({tight}) should be < unclustered ({loose})",
+        );
     }
 
     #[test]

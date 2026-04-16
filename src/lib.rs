@@ -5,3 +5,4 @@ pub mod indexer;
 pub mod layout;
 pub mod parser;
 pub mod resolver;
+pub mod workspace;

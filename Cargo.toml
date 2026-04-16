@@ -11,6 +11,9 @@ walkdir = "2.5"
 swc_common = "21"
 swc_ecma_parser = "38"
 swc_ecma_ast = "23"
+serde_json = "1"
+glob = "0.3"
+ignore = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

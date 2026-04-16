@@ -6,20 +6,28 @@ use walkdir::WalkDir;
 use crate::graph::{Graph, Node};
 use crate::parser::parse_file_imports;
 use crate::resolver::resolve_relative;
+use crate::workspace::Workspace;
 
 const SOURCE_EXTS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs"];
 
-/// Walk `root`, parse every JS/TS file, resolve each relative import, and build
-/// a file-level dependency graph. Skips `node_modules` and hidden directories.
+/// Scan `root` into a `Workspace`, then index every JS/TS file under it.
+/// This is the entry point the app uses when the user drops a folder.
 pub fn index_folder(root: &Path) -> Graph {
-    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let ws = Workspace::discover(root);
+    index_workspace(&ws)
+}
+
+/// Walk the workspace, parse every JS/TS file, resolve relative imports, and
+/// build a file-level dependency graph with each node tagged by its owning
+/// package. Respects the workspace's `.gitignore`-aware matcher.
+pub fn index_workspace(ws: &Workspace) -> Graph {
     let mut graph = Graph::new();
 
     let mut files: Vec<PathBuf> = Vec::new();
-    for entry in WalkDir::new(&canonical_root)
+    for entry in WalkDir::new(&ws.root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| e.depth() == 0 || !is_ignored(e.path()))
+        .filter_entry(|e| e.depth() == 0 || !ws.is_ignored(e.path()))
         .filter_map(Result::ok)
     {
         let path = entry.path();
@@ -39,7 +47,7 @@ pub fn index_folder(root: &Path) -> Graph {
     for f in &files {
         let canonical = f.canonicalize().unwrap_or_else(|_| f.clone());
         let rel = canonical
-            .strip_prefix(&canonical_root)
+            .strip_prefix(&ws.root)
             .unwrap_or(&canonical)
             .to_path_buf();
         let id = rel.to_string_lossy().replace('\\', "/");
@@ -47,10 +55,12 @@ pub fn index_folder(root: &Path) -> Graph {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| id.clone());
+        let package = ws.owning_package(&canonical).map(|p| p.name.clone());
         graph.add_node(Node {
             id: id.clone(),
             path: canonical.clone(),
             label,
+            package,
         });
         id_by_path.insert(canonical, id);
     }
@@ -72,14 +82,6 @@ pub fn index_folder(root: &Path) -> Graph {
     }
 
     graph
-}
-
-fn is_ignored(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    // Skip node_modules and any hidden directory (e.g. `.git`, `.next`, `.turbo`).
-    name == "node_modules" || (name.starts_with('.') && name != "." && name != "..")
 }
 
 #[cfg(test)]
@@ -108,5 +110,40 @@ mod tests {
 
         let g = index_folder(dir.path());
         assert_eq!(g.nodes.len(), 1);
+    }
+
+    #[test]
+    fn tags_files_with_owning_package() {
+        // Two workspace packages — each file must carry its owning package name.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("yarn.lock"), "").unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"root","workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("packages/a")).unwrap();
+        fs::create_dir_all(dir.path().join("packages/b")).unwrap();
+        fs::write(
+            dir.path().join("packages/a/package.json"),
+            r#"{"name":"@org/a"}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("packages/b/package.json"),
+            r#"{"name":"@org/b"}"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("packages/a/index.ts"), "").unwrap();
+        fs::write(dir.path().join("packages/b/index.ts"), "").unwrap();
+
+        let g = index_folder(dir.path());
+        let packages: Vec<_> = g
+            .nodes
+            .values()
+            .filter_map(|n| n.package.clone())
+            .collect();
+        assert!(packages.contains(&"@org/a".to_string()));
+        assert!(packages.contains(&"@org/b".to_string()));
     }
 }

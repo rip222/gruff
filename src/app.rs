@@ -14,6 +14,10 @@ pub struct GruffApp {
     layout: Layout,
     imports: HashMap<NodeId, Vec<NodeId>>,
     imported_by: HashMap<NodeId, Vec<NodeId>>,
+    /// Stable index per package name, used to look up the node's color. The
+    /// index order is whatever the first sweep through `graph.nodes` produced —
+    /// good enough for deterministic colors within a single session.
+    package_indices: HashMap<String, usize>,
     selected: Option<NodeId>,
     camera: Vec2,
     zoom: f32,
@@ -28,6 +32,7 @@ impl Default for GruffApp {
             layout: Layout::new(),
             imports: HashMap::new(),
             imported_by: HashMap::new(),
+            package_indices: HashMap::new(),
             selected: None,
             camera: Vec2::new(0.0, 0.0),
             zoom: 1.0,
@@ -63,6 +68,23 @@ impl GruffApp {
             v.sort();
         }
 
+        // Assign each package a stable color index. Iterate in sorted name
+        // order so the same repo reopens with the same colors regardless of
+        // HashMap iteration order.
+        self.package_indices.clear();
+        let mut names: Vec<&str> = self
+            .graph
+            .nodes
+            .values()
+            .filter_map(|n| n.package.as_deref())
+            .collect();
+        names.sort();
+        names.dedup();
+        for name in names {
+            let next = self.package_indices.len();
+            self.package_indices.insert(name.to_string(), next);
+        }
+
         self.layout = Layout::new();
         self.layout.sync(&self.graph);
         self.selected = None;
@@ -82,6 +104,21 @@ impl GruffApp {
             (world.x - self.camera.x) * self.zoom + screen_center.x,
             (world.y - self.camera.y) * self.zoom + screen_center.y,
         )
+    }
+
+    /// Color for an unselected node. Workspace files take their owning
+    /// package's color; files outside every package fall back to [`colors::NODE`].
+    fn node_color(&self, id: &NodeId) -> egui::Color32 {
+        let Some(node) = self.graph.nodes.get(id) else {
+            return colors::NODE;
+        };
+        let Some(pkg) = node.package.as_deref() else {
+            return colors::NODE;
+        };
+        let Some(&idx) = self.package_indices.get(pkg) else {
+            return colors::NODE;
+        };
+        colors::package_color(idx)
     }
 
     fn node_render_radius(&self, id: &NodeId, zoom_scale: f32) -> f32 {
@@ -139,8 +176,24 @@ impl GruffApp {
                 .color(colors::HINT)
                 .small(),
         );
-        // Stubbed until workspace discovery (slice #5).
-        ui.label(egui::RichText::new("(pending workspace discovery)").italics());
+        match node.package.as_deref() {
+            Some(name) => {
+                let swatch = self.node_color(&selected);
+                ui.horizontal(|ui| {
+                    // Small color chip so the sidebar identity matches the
+                    // node's color on the canvas at a glance.
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(10.0, 10.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().rect_filled(rect, 2.0, swatch);
+                    ui.label(egui::RichText::new(name).monospace());
+                });
+            }
+            None => {
+                ui.label(egui::RichText::new("(no owning package)").italics());
+            }
+        }
 
         ui.add_space(8.0);
         let imports = self.imports.get(&selected).cloned().unwrap_or_default();
@@ -321,7 +374,7 @@ impl GruffApp {
             let color = if is_selected {
                 colors::SELECTED
             } else {
-                colors::NODE
+                self.node_color(id)
             };
             painter.circle_filled(p, radius, color);
             if is_selected {
