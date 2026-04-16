@@ -10,11 +10,17 @@ use crate::editor::{self, OpenError};
 use crate::graph::{Edge, Graph, NodeId, NodeKind};
 use crate::indexer::index_folder;
 use crate::layout::{Layout, Vec2};
+use crate::search;
 
 /// Quick-pick editor commands surfaced as buttons in the picker. Ordered by
 /// rough popularity on macOS — VS Code first, then the classic terminal
 /// editors, then JetBrains.
 const QUICK_PICK_EDITORS: &[&str] = &["code", "cursor", "subl", "idea", "nvim", "vim"];
+
+/// Click tolerance for edge hit-testing, in screen pixels. Set wider than the
+/// edge stroke width so clicks near a thin 1 px line still land — trackpads
+/// and mice jitter a few pixels per click.
+const EDGE_HIT_PX: f32 = 6.0;
 
 /// Action queued while the editor picker modal is open, resumed after the
 /// user picks a valid editor.
@@ -36,6 +42,23 @@ struct PathHighlight {
     /// Every node touched by an edge in `edges`. Used to decide which nodes
     /// stay full-opacity and which fade out.
     nodes: HashSet<NodeId>,
+}
+
+/// State for the Cmd+F fuzzy-search overlay. Kept as a cached match set so
+/// the render loop does O(1) `contains` lookups per node instead of
+/// re-running the matcher against every node every frame.
+struct SearchState {
+    /// Current text in the search input. Empty right after opening.
+    input: String,
+    /// Set of node ids that match `input` under the package-aware rule.
+    /// Recomputed when `input` changes; empty when `input` is empty/whitespace.
+    matches: HashSet<NodeId>,
+    /// Snapshot of the last input we computed matches for, used to skip
+    /// recomputation when the user is e.g. holding an arrow key in the field.
+    last_computed_input: String,
+    /// One-shot flag: request keyboard focus on the text field on the first
+    /// frame after opening. Consumed by `draw_search_overlay`.
+    request_focus: bool,
 }
 
 struct EditorPromptState {
@@ -86,6 +109,10 @@ pub struct GruffApp {
     config: Config,
     /// Editor picker modal state; `Some` while the prompt is visible.
     editor_prompt: Option<EditorPromptState>,
+    /// Cmd+F fuzzy-search overlay state; `Some` while the overlay is open.
+    /// `None` closes the overlay and clears any search-driven dim state —
+    /// the renderer keys off `is_some` rather than a separate flag.
+    search: Option<SearchState>,
 }
 
 impl Default for GruffApp {
@@ -108,6 +135,7 @@ impl Default for GruffApp {
             unresolved_dynamic: 0,
             config: config::load(),
             editor_prompt: None,
+            search: None,
         }
     }
 }
@@ -179,6 +207,10 @@ impl GruffApp {
         }
         self.frame_request = None;
         self.highlight = None;
+        // Reset the search overlay on a new folder load — the cached match
+        // set references node ids from the previous graph and would be
+        // nonsensical against the new one.
+        self.search = None;
 
         self.layout = Layout::new();
         self.layout.sync(&self.graph);
@@ -299,9 +331,6 @@ impl GruffApp {
         screen_pos: egui::Pos2,
         screen_center: egui::Pos2,
     ) -> Option<(NodeId, NodeId)> {
-        // 5 px is comfortable on a trackpad without making edges impossible
-        // to miss when the user actually meant to click empty canvas.
-        const EDGE_HIT_PX: f32 = 5.0;
         let mut best: Option<(f32, (NodeId, NodeId))> = None;
         for edge in &self.graph.edges {
             let (Some(pa), Some(pb)) = (self.layout.get(&edge.from), self.layout.get(&edge.to))
@@ -339,6 +368,9 @@ impl GruffApp {
 
     /// Find the topmost node at `screen_pos` within its visible radius.
     /// Nodes are compared in screen space so hit tolerance scales with zoom.
+    /// Hit radius tracks the drawn radius (with a 6 px floor for tiny nodes)
+    /// so large hubs don't swallow clicks meant for attached edges — that
+    /// previously made edges entering hubs effectively unclickable.
     fn pick_node(&self, screen_pos: egui::Pos2, screen_center: egui::Pos2) -> Option<NodeId> {
         let zoom_scale = self.zoom.clamp(0.5, 2.0);
         let mut best: Option<(f32, NodeId)> = None;
@@ -348,8 +380,10 @@ impl GruffApp {
             let dy = p.y - screen_pos.y;
             let dist_sq = dx * dx + dy * dy;
             let r = self.node_render_radius(id, zoom_scale);
-            // Add a small pixel buffer so tiny nodes remain clickable.
-            let hit_r = r + 2.0;
+            // Match the drawn radius with a modest floor so 2–4 px nodes at
+            // low zoom aren't impossibly small targets. No extra buffer on
+            // top of the drawn radius — the buffer used to eat edge clicks.
+            let hit_r = r.max(6.0);
             if dist_sq <= hit_r * hit_r {
                 match &best {
                     Some((d, _)) if *d <= dist_sq => {}
@@ -481,6 +515,114 @@ impl GruffApp {
                 }
             }
         }
+    }
+
+    /// Toggle the search overlay. If it's already open we close it (Cmd+F
+    /// as a dismiss shortcut feels natural next to Escape); otherwise open
+    /// a fresh empty search. Selection is intentionally preserved either way.
+    fn toggle_search(&mut self) {
+        if self.search.is_some() {
+            self.search = None;
+        } else {
+            self.search = Some(SearchState {
+                input: String::new(),
+                matches: HashSet::new(),
+                last_computed_input: String::new(),
+                request_focus: true,
+            });
+        }
+    }
+
+    /// Recompute the cached match set if the query text has changed since
+    /// the last recompute. Cheap no-op when nothing changed — keeps the
+    /// render loop fast when the user is idle in the overlay.
+    fn refresh_search_matches(&mut self) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        if search.input == search.last_computed_input {
+            return;
+        }
+        search.matches = search::compute_matches(&search.input, &self.graph.nodes);
+        search.last_computed_input = search.input.clone();
+    }
+
+    fn draw_search_overlay(&mut self, ctx: &egui::Context) {
+        let Some(search) = self.search.as_ref() else {
+            return;
+        };
+        let mut input = search.input.clone();
+        let request_focus = search.request_focus;
+        let match_count = search.matches.len();
+        let query_empty = search.input.trim().is_empty();
+
+        let mut close = false;
+
+        // Anchored near top-center of the viewport so the overlay doesn't
+        // hide the sidebar or cover the status line. `Area` (rather than
+        // `Window`) keeps the chrome minimal — no title bar, no resize.
+        egui::Area::new(egui::Id::new("gruff-search-overlay"))
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 16.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .inner_margin(egui::Margin::symmetric(12, 10))
+                    .show(ui, |ui| {
+                        ui.set_min_width(360.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Search")
+                                    .color(colors::HINT)
+                                    .small(),
+                            );
+                            let edit = ui.add(
+                                egui::TextEdit::singleline(&mut input)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("file or package name"),
+                            );
+                            if request_focus {
+                                edit.request_focus();
+                            }
+                        });
+                        ui.add_space(4.0);
+                        let status = if query_empty {
+                            "Type to filter · Esc to close".to_string()
+                        } else {
+                            format!(
+                                "{match_count} match{} · Esc to close",
+                                if match_count == 1 { "" } else { "es" },
+                            )
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(status)
+                                    .color(colors::HINT)
+                                    .small(),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("×").clicked() {
+                                        close = true;
+                                    }
+                                },
+                            );
+                        });
+                    });
+            });
+
+        if let Some(search) = self.search.as_mut() {
+            search.input = input;
+            // `request_focus` is a one-shot; clear it after the first frame
+            // so subsequent frames don't keep stealing focus from clicks
+            // into other widgets.
+            search.request_focus = false;
+        }
+        if close {
+            self.search = None;
+            return;
+        }
+        self.refresh_search_matches();
     }
 
     fn draw_editor_prompt(&mut self, ctx: &egui::Context) {
@@ -882,17 +1024,33 @@ impl eframe::App for GruffApp {
             }
         }
 
+        // Cmd+F opens (or closes) the fuzzy-search overlay. We gate it on
+        // having a loaded graph so the shortcut doesn't surface a useless
+        // empty overlay on the initial onboarding screen.
+        let search_requested =
+            ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F));
+        if search_requested && !self.graph.nodes.is_empty() {
+            self.toggle_search();
+        }
+
         // Space toggles the physics simulation (useful when it settles).
-        if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+        // Skip while the search overlay is open so typing a space in the
+        // search box doesn't pause physics.
+        if self.search.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Space)) {
             self.sim_enabled = !self.sim_enabled;
         }
 
-        // Escape deselects, or dismisses the editor prompt if it's open.
-        // Also clears any active edge-path highlight so `Escape` is a
-        // universal "go back to a clean canvas" key.
+        // Escape deselects, or dismisses whichever overlay is open. Priority:
+        // editor prompt → search overlay → clear selection/highlight. Each
+        // stage handles exactly one pressed Escape so the user can unwind
+        // state layer by layer.
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if self.editor_prompt.is_some() {
                 self.editor_prompt = None;
+            } else if self.search.is_some() {
+                // Closing the overlay clears the dim state per the issue's
+                // acceptance criteria — the search struct owns both.
+                self.search = None;
             } else {
                 self.selected = None;
                 self.highlight = None;
@@ -964,6 +1122,9 @@ impl eframe::App for GruffApp {
                 self.draw_canvas(ui);
             });
 
+        // Drawn before the editor prompt so a modal still paints on top of
+        // the search overlay — the modal is strictly more blocking.
+        self.draw_search_overlay(&ctx);
         // Drawn last so the modal paints over the sidebar and canvas.
         self.draw_editor_prompt(&ctx);
     }
@@ -1018,6 +1179,14 @@ impl GruffApp {
                 self.camera.x = world_before_x - (hover.x - center.x) / self.zoom;
                 self.camera.y = world_before_y - (hover.y - center.y) / self.zoom;
             }
+
+            // Pointer-hand cursor over nodes and edges signals clickability
+            // — essential feedback now that edges are click targets too.
+            // Node check first so a node under the cursor wins regardless of
+            // whether an edge also passes nearby.
+            if self.pick_node(hover, center).is_some() || self.pick_edge(hover, center).is_some() {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
         }
 
         let painter = ui.painter_at(rect);
@@ -1026,6 +1195,15 @@ impl GruffApp {
         // competing with the highlighted edges for attention.
         const DIM_ALPHA: f32 = 0.18;
         let highlight_active = self.highlight.is_some();
+        // Search-driven dimming is independent of highlight-driven dimming;
+        // a node/edge is dimmed if *either* mode says dim. `search_matches`
+        // is `None` when no search is active, which short-circuits the
+        // per-element check to "not dimmed by search".
+        let search_matches: Option<&HashSet<NodeId>> = self
+            .search
+            .as_ref()
+            .filter(|s| !s.input.trim().is_empty())
+            .map(|s| &s.matches);
 
         // Edges first so nodes overlap them.
         for edge in &self.graph.edges {
@@ -1051,9 +1229,20 @@ impl GruffApp {
             } else {
                 colors::EDGE
             };
+            // Search dims an edge when either endpoint isn't a match —
+            // otherwise the edge visually anchors to a dim node and reads
+            // like a loose thread. `selected` keeps its edges lit so the
+            // current selection stays informative under search.
+            let search_dim = search_matches.is_some_and(|m| {
+                let from_lit =
+                    m.contains(&edge.from) || self.selected.as_ref() == Some(&edge.from);
+                let to_lit =
+                    m.contains(&edge.to) || self.selected.as_ref() == Some(&edge.to);
+                !(from_lit && to_lit)
+            });
             let (width, color) = if on_path {
                 (2.0, base)
-            } else if highlight_active {
+            } else if highlight_active || search_dim {
                 (1.0, base.gamma_multiply(DIM_ALPHA))
             } else if is_cycle {
                 (1.6, base)
@@ -1079,7 +1268,12 @@ impl GruffApp {
             };
             // Fade nodes that aren't on the highlighted chain; keep the
             // selected node fully opaque even when no chain is active.
-            let color = if highlight_active && !on_path && !is_selected {
+            // Same rule for search: selected stays lit so the user can
+            // always see which file they had focused.
+            let dim_by_highlight = highlight_active && !on_path && !is_selected;
+            let dim_by_search =
+                search_matches.is_some_and(|m| !m.contains(id) && !is_selected);
+            let color = if dim_by_highlight || dim_by_search {
                 base.gamma_multiply(DIM_ALPHA)
             } else {
                 base
