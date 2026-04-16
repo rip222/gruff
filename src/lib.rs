@@ -9,6 +9,7 @@ pub mod filters;
 pub mod graph;
 pub mod indexer;
 pub mod layout;
+pub mod node_label;
 pub mod parser;
 pub mod resolver;
 pub mod search;

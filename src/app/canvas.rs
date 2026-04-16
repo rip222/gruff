@@ -6,6 +6,7 @@ use crate::camera::Bbox;
 use crate::colors;
 use crate::graph::{NodeId, NodeKind};
 use crate::layout::Vec2;
+use crate::node_label;
 
 use super::{FitMode, GruffApp};
 
@@ -22,6 +23,39 @@ const FIT_PADDING: f32 = 60.0;
 /// Half-life of the camera tween animation in seconds. Short enough to feel
 /// immediate, long enough to read as motion rather than a jump cut.
 const CAMERA_TWEEN_HALF_LIFE: f32 = 0.12;
+
+/// Base world-space font size for node labels. The on-screen size is this
+/// times the camera zoom, so labels shrink when you zoom out and grow when
+/// you zoom in — exactly how a label painted on the world itself would behave.
+const LABEL_WORLD_FONT_SIZE: f32 = 12.0;
+
+/// Horizontal padding inside the node rect, in world units. Leaves visual
+/// breathing room between the label and the rect's rounded edge.
+const RECT_H_PADDING: f32 = 6.0;
+
+/// Vertical padding inside the node rect, in world units. Controls the
+/// minimum rect height and provides the residual "more-dependents = taller"
+/// growth channel — a hub's padding adds a few extra world-units of height.
+const RECT_V_PADDING: f32 = 4.0;
+
+/// Cap on the world-space bonus height a node earns from having many
+/// dependents. Sqrt-scaled below this cap so a megahub (1000+ dependents)
+/// doesn't dwarf every other node into visual noise.
+const RECT_DEPENDENTS_BONUS_CAP: f32 = 12.0;
+
+/// Corner radius of the node rect, in world units. Picked to read as
+/// unambiguously rounded at typical zoom without softening into a blob.
+const RECT_CORNER_RADIUS: f32 = 4.0;
+
+/// Below this on-screen font size (in pixels), text would be sub-readable and
+/// pile into a blur. Hide labels when the effective size drops under this —
+/// the rects themselves still draw.
+const LABEL_MIN_SCREEN_FONT_PX: f32 = 7.0;
+
+/// Minimum world-space rect width when the label is empty or we can't measure
+/// it. Prevents truly degenerate zero-width rects from producing an invisible
+/// click target.
+const RECT_MIN_WIDTH: f32 = 14.0;
 
 impl GruffApp {
     /// True when this edge lies inside a cyclic SCC. An edge `(u,v)` is on a
@@ -93,14 +127,26 @@ impl GruffApp {
         colors::package_color(idx)
     }
 
-    fn node_render_radius(&self, id: &NodeId, zoom_scale: f32) -> f32 {
+    /// World-space size of a node's rounded-rect body. Width is driven by the
+    /// text label (measured in world-unit font-size so the rect fits the
+    /// text at any zoom). Height carries the residual "more-dependents =
+    /// bigger" signal via extra world-unit vertical padding, sqrt-capped so
+    /// a 1000-dependent hub doesn't dwarf ordinary nodes.
+    fn node_render_size_world(&self, id: &NodeId, ui: &egui::Ui) -> Vec2 {
+        let label = self
+            .graph
+            .nodes
+            .get(id)
+            .map(node_label::display_label)
+            .unwrap_or_default();
+        let text_width = measure_text_width(ui, &label, LABEL_WORLD_FONT_SIZE);
+
         let deps = self.imported_by.get(id).map(|v| v.len()).unwrap_or(0) as f32;
-        // Sqrt keeps the growth gentle; capping the dependents bonus prevents
-        // a single megahub (1000+ dependents) from dwarfing every other node
-        // into visual noise. The cap is world-units; the full radius is
-        // zoomed afterwards so hotspots still scale with viewport zoom.
-        let deps_bonus = (deps.sqrt() * 2.0).min(24.0);
-        (4.0 + deps_bonus) * zoom_scale
+        let deps_bonus = (deps.sqrt() * 2.0).min(RECT_DEPENDENTS_BONUS_CAP);
+
+        let width = (text_width + RECT_H_PADDING * 2.0).max(RECT_MIN_WIDTH);
+        let height = LABEL_WORLD_FONT_SIZE + RECT_V_PADDING * 2.0 + deps_bonus;
+        Vec2::new(width, height)
     }
 
     /// Find the edge whose on-screen line segment is closest to `screen_pos`,
@@ -131,28 +177,37 @@ impl GruffApp {
         best.map(|(_, e)| e)
     }
 
-    /// Find the topmost node at `screen_pos` within its visible radius.
-    /// Nodes are compared in screen space so hit tolerance scales with zoom.
-    /// Hit radius tracks the drawn radius (with a 6 px floor for tiny nodes)
-    /// so large hubs don't swallow clicks meant for attached edges — that
-    /// previously made edges entering hubs effectively unclickable.
-    fn pick_node(&self, screen_pos: egui::Pos2, screen_center: egui::Pos2) -> Option<NodeId> {
-        let zoom_scale = self.camera.zoom().clamp(0.5, 2.0);
+    /// Find the topmost node at `screen_pos` whose drawn rect covers it.
+    /// Hit-test is rect-based to match the new rounded-rect node shape.
+    /// Ties (two overlapping rects both contain the point) resolve by
+    /// smallest area, so the more specific target wins — a tiny leaf node
+    /// stacked on a hub's rect still receives the click.
+    fn pick_node(
+        &self,
+        screen_pos: egui::Pos2,
+        screen_center: egui::Pos2,
+        ui: &egui::Ui,
+    ) -> Option<NodeId> {
+        let zoom = self.camera.zoom();
         let mut best: Option<(f32, NodeId)> = None;
         for (id, world) in self.layout.iter() {
             let p = self.world_to_screen(world, screen_center);
-            let dx = p.x - screen_pos.x;
-            let dy = p.y - screen_pos.y;
-            let dist_sq = dx * dx + dy * dy;
-            let r = self.node_render_radius(id, zoom_scale);
-            // Match the drawn radius with a modest floor so 2–4 px nodes at
-            // low zoom aren't impossibly small targets. No extra buffer on
-            // top of the drawn radius — the buffer used to eat edge clicks.
-            let hit_r = r.max(6.0);
-            if dist_sq <= hit_r * hit_r {
+            let size = self.node_render_size_world(id, ui);
+            // Convert world-space rect dimensions to screen-space so the hit
+            // area tracks what the user actually sees.
+            let half_w_px = size.x * zoom * 0.5;
+            let half_h_px = size.y * zoom * 0.5;
+            // Floor the half-extents so a node that drew as 2–3 px at low
+            // zoom isn't an impossibly small click target.
+            let half_w_hit = half_w_px.max(3.0);
+            let half_h_hit = half_h_px.max(3.0);
+            let dx = (screen_pos.x - p.x).abs();
+            let dy = (screen_pos.y - p.y).abs();
+            if dx <= half_w_hit && dy <= half_h_hit {
+                let area = half_w_hit * half_h_hit;
                 match &best {
-                    Some((d, _)) if *d <= dist_sq => {}
-                    _ => best = Some((dist_sq, id.clone())),
+                    Some((a, _)) if *a <= area => {}
+                    _ => best = Some((area, id.clone())),
                 }
             }
         }
@@ -214,7 +269,7 @@ impl GruffApp {
         // clears both the selection and any active path highlight.
         if response.clicked() {
             if let Some(click_pos) = response.interact_pointer_pos() {
-                if let Some(node) = self.pick_node(click_pos, center) {
+                if let Some(node) = self.pick_node(click_pos, center, ui) {
                     self.selected = Some(node);
                     self.highlight = None;
                 } else if let Some((from, to)) = self.pick_edge(click_pos, center) {
@@ -244,7 +299,9 @@ impl GruffApp {
             // — essential feedback now that edges are click targets too.
             // Node check first so a node under the cursor wins regardless of
             // whether an edge also passes nearby.
-            if self.pick_node(hover, center).is_some() || self.pick_edge(hover, center).is_some() {
+            if self.pick_node(hover, center, ui).is_some()
+                || self.pick_edge(hover, center).is_some()
+            {
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             }
         }
@@ -310,10 +367,27 @@ impl GruffApp {
             painter.line_segment([a, b], egui::Stroke::new(width, color));
         }
 
-        let zoom_scale = self.camera.zoom().clamp(0.5, 2.0);
+        // Labels render in world space — font size scales with zoom — and
+        // hide entirely when they'd be sub-readable. The rect itself always
+        // draws, so the graph shape stays legible at low zoom.
+        let zoom = self.camera.zoom();
+        let screen_font_px = LABEL_WORLD_FONT_SIZE * zoom;
+        let labels_visible = screen_font_px >= LABEL_MIN_SCREEN_FONT_PX;
+        let label_font = egui::FontId::proportional(screen_font_px);
+
         for (id, pos) in self.layout.iter() {
             let p = self.world_to_screen(pos, center);
-            let radius = self.node_render_radius(id, zoom_scale);
+            let size_world = self.node_render_size_world(id, ui);
+            // World-space rect centered on the node position; project the
+            // corners to screen by scaling with zoom. This is equivalent to
+            // `world_to_screen` of the corners but avoids two extra calls.
+            let half_w_px = size_world.x * zoom * 0.5;
+            let half_h_px = size_world.y * zoom * 0.5;
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(p.x - half_w_px, p.y - half_h_px),
+                egui::pos2(p.x + half_w_px, p.y + half_h_px),
+            );
+
             let is_selected = self.selected.as_ref() == Some(id);
             let on_path = self
                 .highlight
@@ -335,14 +409,48 @@ impl GruffApp {
             } else {
                 base
             };
-            painter.circle_filled(p, radius, color);
+
+            // Corner radius also scales with zoom so the rounded look holds
+            // at any scale — a constant pixel radius would wash out to a
+            // square at low zoom.
+            let corner_px = (RECT_CORNER_RADIUS * zoom).clamp(1.0, 10.0);
+            painter.rect_filled(rect, corner_px, color);
+
             if is_selected {
                 // Outer ring makes the selection pop even at low zoom.
-                painter.circle_stroke(
-                    p,
-                    radius + 3.0,
+                let ring_rect = rect.expand(3.0);
+                painter.rect_stroke(
+                    ring_rect,
+                    corner_px + 2.0,
                     egui::Stroke::new(2.0, colors::SELECTED_RING),
+                    egui::StrokeKind::Outside,
                 );
+            }
+
+            if labels_visible {
+                let label = self
+                    .graph
+                    .nodes
+                    .get(id)
+                    .map(node_label::display_label)
+                    .unwrap_or_default();
+                if !label.is_empty() {
+                    // Text color: foreground that reads on the dim/fill alpha
+                    // combination. Dim nodes get a dim label too so the pair
+                    // reads as a unit.
+                    let text_color = if dim_by_highlight || dim_by_search {
+                        colors::HINT.gamma_multiply(DIM_ALPHA * 2.0)
+                    } else {
+                        egui::Color32::from_rgb(0xF4, 0xF6, 0xF8)
+                    };
+                    painter.text(
+                        p,
+                        egui::Align2::CENTER_CENTER,
+                        &label,
+                        label_font.clone(),
+                        text_color,
+                    );
+                }
             }
         }
 
@@ -356,6 +464,22 @@ impl GruffApp {
             );
         }
     }
+}
+
+/// Measure the rendered width of `text` at `font_size`, using the current
+/// `ui`'s font stack. Returns a world-unit width when `font_size` is the
+/// world-space font size — the pixel width of text rendered at that exact
+/// size, which happens to equal its world width at zoom = 1 and scales
+/// linearly with zoom everywhere else.
+fn measure_text_width(ui: &egui::Ui, text: &str, font_size: f32) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let font_id = egui::FontId::proportional(font_size);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font_id, egui::Color32::WHITE);
+    galley.size().x
 }
 
 /// Shortest distance from a point to a line segment in 2D (screen space).
