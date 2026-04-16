@@ -34,6 +34,21 @@ impl GruffApp {
             &self.imported_by,
         )
     }
+
+    /// Build a [`PathHighlight`] for a clicked node: the union of the node's
+    /// recursive upstream closure (every ancestor that can reach it) and its
+    /// recursive downstream closure (every descendant it can reach), plus
+    /// every edge whose endpoints both lie in that union. Sibling branches
+    /// — nodes that share a parent with the clicked node but aren't on its
+    /// chain — are excluded.
+    pub(super) fn build_node_highlight(&self, node: &NodeId) -> PathHighlight {
+        compute_node_highlight(
+            node,
+            &self.graph.edges,
+            &self.imports,
+            &self.imported_by,
+        )
+    }
 }
 
 /// Pure path-highlight builder: collect every edge that lies on a path
@@ -72,6 +87,48 @@ fn compute_path_highlight(
     let mut nodes: HashSet<NodeId> = HashSet::new();
     nodes.extend(upstream);
     nodes.extend(downstream);
+    PathHighlight {
+        edges: hl_edges,
+        nodes,
+    }
+}
+
+/// Pure node-highlight builder: collect the clicked node's recursive
+/// upstream closure (every ancestor that can reach it via reverse edges)
+/// unioned with its recursive downstream closure (every descendant it can
+/// reach via forward edges), plus every edge whose endpoints both live in
+/// that union. Siblings of the clicked node that share a parent but aren't
+/// on its chain are intentionally excluded — an edge from a shared parent
+/// out to a sibling has one endpoint (the sibling) outside the union, so
+/// it isn't picked up.
+fn compute_node_highlight(
+    node: &NodeId,
+    edges: &[Edge],
+    imports: &HashMap<NodeId, Vec<NodeId>>,
+    imported_by: &HashMap<NodeId, Vec<NodeId>>,
+) -> PathHighlight {
+    // Walk reverse edges for ancestors, forward edges for descendants. The
+    // clicked node appears in both sets (bfs_visit includes `start`), which
+    // is exactly what we want — it's the hub of the highlight.
+    let upstream = bfs_visit(node, imported_by);
+    let downstream = bfs_visit(node, imports);
+
+    let mut nodes: HashSet<NodeId> = HashSet::new();
+    nodes.extend(upstream);
+    nodes.extend(downstream);
+
+    // An edge belongs to the highlight iff both endpoints live in the
+    // union. A shared parent `p` points at both the clicked node and a
+    // sibling `s`; `p` is in the union (ancestor) but `s` isn't, so the
+    // `p -> s` edge is correctly excluded — the "sibling branches stay
+    // dim" guarantee from PRD #16.
+    let mut hl_edges: HashSet<(NodeId, NodeId)> = HashSet::new();
+    for e in edges {
+        if nodes.contains(&e.from) && nodes.contains(&e.to) {
+            hl_edges.insert((e.from.clone(), e.to.clone()));
+        }
+    }
+
     PathHighlight {
         edges: hl_edges,
         nodes,
@@ -201,6 +258,114 @@ mod tests {
         for n in ["root", "a", "b", "c", "leaf"] {
             assert!(hl.nodes.contains(&id(n)), "expected {n} in path highlight");
         }
+    }
+
+    #[test]
+    fn node_highlight_multi_parent_multi_child_full_closure() {
+        // Two parents p1, p2 both point at n. n points at two children c1, c2.
+        // Grandparent gp sits above p1; grandchild gc sits below c1. Clicking
+        // n must pull in the full upstream and downstream closure — gp, p1,
+        // p2 on the ancestor side; c1, c2, gc on the descendant side — plus
+        // every edge whose endpoints both live in that set.
+        let edges = vec![
+            edge("gp", "p1"),
+            edge("p1", "n"),
+            edge("p2", "n"),
+            edge("n", "c1"),
+            edge("n", "c2"),
+            edge("c1", "gc"),
+        ];
+        let (fwd, rev) = adj(&edges);
+        let hl = compute_node_highlight(&id("n"), &edges, &fwd, &rev);
+        for expected in ["gp", "p1", "p2", "n", "c1", "c2", "gc"] {
+            assert!(
+                hl.nodes.contains(&id(expected)),
+                "expected node {expected} in node-click highlight"
+            );
+        }
+        // Every edge in the graph has both endpoints inside the closure
+        // here — no sibling branches exist — so all six edges highlight.
+        assert_eq!(hl.edges.len(), 6);
+        for (f, t) in [
+            ("gp", "p1"),
+            ("p1", "n"),
+            ("p2", "n"),
+            ("n", "c1"),
+            ("n", "c2"),
+            ("c1", "gc"),
+        ] {
+            assert!(
+                hl.edges.contains(&(id(f), id(t))),
+                "expected edge {f}->{t} in node-click highlight"
+            );
+        }
+    }
+
+    #[test]
+    fn node_highlight_excludes_sibling_branches() {
+        // Shared parent `p` points at both `n` (clicked) and `sibling`. `n`
+        // has its own child `c` and `sibling` has its own child `sc`.
+        // Clicking `n` must include p, n, c — but NOT sibling or sc. The
+        // `p -> sibling` edge must also be dim because `sibling` isn't in
+        // the closure.
+        let edges = vec![
+            edge("p", "n"),
+            edge("p", "sibling"),
+            edge("n", "c"),
+            edge("sibling", "sc"),
+        ];
+        let (fwd, rev) = adj(&edges);
+        let hl = compute_node_highlight(&id("n"), &edges, &fwd, &rev);
+        assert!(hl.nodes.contains(&id("p")));
+        assert!(hl.nodes.contains(&id("n")));
+        assert!(hl.nodes.contains(&id("c")));
+        assert!(
+            !hl.nodes.contains(&id("sibling")),
+            "sibling must stay dim on node-click highlight"
+        );
+        assert!(
+            !hl.nodes.contains(&id("sc")),
+            "sibling's descendant must stay dim on node-click highlight"
+        );
+        // The shared-parent → sibling edge must be excluded even though one
+        // endpoint (the parent) is in the closure — the PRD's "siblings
+        // stay dim" guarantee only holds if the connecting edge also dims.
+        assert!(
+            !hl.edges.contains(&(id("p"), id("sibling"))),
+            "sibling-branch edge must be excluded"
+        );
+        assert!(!hl.edges.contains(&(id("sibling"), id("sc"))));
+        // And the on-chain edges are all present.
+        for (f, t) in [("p", "n"), ("n", "c")] {
+            assert!(hl.edges.contains(&(id(f), id(t))));
+        }
+    }
+
+    #[test]
+    fn node_highlight_on_leaf_collapses_to_ancestors() {
+        // Leaf node with no outgoing edges: the downstream closure is just
+        // the node itself, so the highlight is purely the upstream chain
+        // plus the node.
+        let edges = vec![edge("a", "b"), edge("b", "leaf")];
+        let (fwd, rev) = adj(&edges);
+        let hl = compute_node_highlight(&id("leaf"), &edges, &fwd, &rev);
+        assert!(hl.nodes.contains(&id("a")));
+        assert!(hl.nodes.contains(&id("b")));
+        assert!(hl.nodes.contains(&id("leaf")));
+        assert_eq!(hl.nodes.len(), 3);
+        assert_eq!(hl.edges.len(), 2);
+    }
+
+    #[test]
+    fn node_highlight_cycle_terminates() {
+        // Clicking a node inside a cycle must terminate and include every
+        // cycle member. The `start` is in both bfs visits, so the whole
+        // SCC lands in the closure.
+        let edges = vec![edge("a", "b"), edge("b", "c"), edge("c", "a")];
+        let (fwd, rev) = adj(&edges);
+        let hl = compute_node_highlight(&id("a"), &edges, &fwd, &rev);
+        assert_eq!(hl.nodes.len(), 3);
+        assert_eq!(hl.edges.len(), 3);
     }
 
     #[test]
