@@ -603,6 +603,42 @@ mod tests {
     }
 
     #[test]
+    fn sync_absorbs_incremental_diff_without_restart() {
+        // Survivors of an add+remove diff must keep both their positions AND
+        // their velocities so the force simulation doesn't lurch. This is
+        // what lets watcher-driven updates look smooth on a live graph.
+        let mut g = Graph::new();
+        for id in ["a", "b", "c"] {
+            g.add_node(n(id));
+        }
+        let mut layout = Layout::new();
+        layout.sync(&g);
+
+        // Step a few frames so the sim has actual non-zero velocities to
+        // preserve — a fresh sync has all zeros and hides the bug we'd care
+        // about here.
+        for _ in 0..10 {
+            layout.step(1.0 / 60.0);
+        }
+        let p_b_before = layout.get("b").unwrap();
+        let idx_b = layout.index_of["b"];
+        let v_b_before = layout.velocities[idx_b];
+
+        // Remove `a`, add `d` — classic file-rename diff pattern.
+        g.remove_node("a");
+        g.add_node(n("d"));
+        layout.sync(&g);
+
+        // `b` survived: its position and velocity must be the exact same
+        // floats we captured before the sync, not a reseeded spiral point.
+        assert_eq!(layout.get("b"), Some(p_b_before));
+        let idx_b_after = layout.index_of["b"];
+        assert_eq!(layout.velocities[idx_b_after], v_b_before);
+        assert!(layout.contains("d"));
+        assert!(!layout.contains("a"));
+    }
+
+    #[test]
     fn step_on_empty_graph_is_noop() {
         let mut layout = Layout::new();
         layout.step(0.016);

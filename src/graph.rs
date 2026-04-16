@@ -46,6 +46,55 @@ pub struct Graph {
     pub edges: Vec<Edge>,
 }
 
+/// Incremental update produced by the indexer when a single file changes on
+/// disk. Applied to the live graph in place — the UI doesn't rebuild from
+/// scratch, and the layout simulation absorbs the change without resetting.
+///
+/// Shape matches the PRD schema: four disjoint vectors, where the order of
+/// application is "remove first, then add" so replacing an edge `(a → b)` with
+/// `(a → c)` collapses to `removed: [(a,b)] + added: [(a,c)]` without a
+/// transient state where both exist.
+#[derive(Debug, Default, Clone)]
+pub struct GraphDiff {
+    pub added_nodes: Vec<Node>,
+    pub removed_nodes: Vec<NodeId>,
+    pub added_edges: Vec<Edge>,
+    pub removed_edges: Vec<Edge>,
+}
+
+impl GraphDiff {
+    /// True when no nodes or edges change. Lets callers skip repainting /
+    /// layout resync when a debounced burst of filesystem events boils down
+    /// to "content changed but imports didn't."
+    pub fn is_empty(&self) -> bool {
+        self.added_nodes.is_empty()
+            && self.removed_nodes.is_empty()
+            && self.added_edges.is_empty()
+            && self.removed_edges.is_empty()
+    }
+}
+
+impl Graph {
+    /// Apply a [`GraphDiff`] in place. Removals happen before additions so
+    /// an edge replacement `(a→b) → (a→c)` never transiently has both edges.
+    /// `remove_node` also drops incident edges, so removing a node and an
+    /// incident edge in the same diff is idempotent.
+    pub fn apply(&mut self, diff: &GraphDiff) {
+        for edge in &diff.removed_edges {
+            self.edges.retain(|e| e != edge);
+        }
+        for id in &diff.removed_nodes {
+            self.remove_node(id);
+        }
+        for node in &diff.added_nodes {
+            self.add_node(node.clone());
+        }
+        for edge in &diff.added_edges {
+            self.add_edge(&edge.from, &edge.to);
+        }
+    }
+}
+
 impl Graph {
     pub fn new() -> Self {
         Self::default()
@@ -352,6 +401,61 @@ mod tests {
         let expected: std::collections::BTreeSet<_> =
             ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn diff_apply_removes_then_adds() {
+        // Prior state has edge a→b. Diff removes it and adds a→c — the final
+        // graph must have exactly a→c, never a→b, and the new node c.
+        let mut g = Graph::new();
+        g.add_node(node("a"));
+        g.add_node(node("b"));
+        g.add_edge("a", "b");
+
+        let diff = GraphDiff {
+            added_nodes: vec![node("c")],
+            removed_nodes: vec![],
+            added_edges: vec![Edge {
+                from: "a".into(),
+                to: "c".into(),
+            }],
+            removed_edges: vec![Edge {
+                from: "a".into(),
+                to: "b".into(),
+            }],
+        };
+        g.apply(&diff);
+
+        assert!(g.nodes.contains_key("c"));
+        assert_eq!(g.edges.len(), 1);
+        assert_eq!(g.edges[0].from, "a");
+        assert_eq!(g.edges[0].to, "c");
+    }
+
+    #[test]
+    fn diff_remove_node_drops_incident_edges() {
+        let mut g = Graph::new();
+        g.add_node(node("a"));
+        g.add_node(node("b"));
+        g.add_edge("a", "b");
+        g.add_edge("b", "a");
+
+        let diff = GraphDiff {
+            added_nodes: vec![],
+            removed_nodes: vec!["a".into()],
+            added_edges: vec![],
+            removed_edges: vec![],
+        };
+        g.apply(&diff);
+
+        assert_eq!(g.nodes.len(), 1);
+        assert!(g.edges.is_empty());
+    }
+
+    #[test]
+    fn diff_is_empty_for_noop() {
+        let diff = GraphDiff::default();
+        assert!(diff.is_empty());
     }
 
     #[test]

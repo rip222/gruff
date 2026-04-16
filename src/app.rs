@@ -1,14 +1,15 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
 use crate::colors;
 use crate::config::{self, Config};
-use crate::graph::{Graph, NodeId};
-use crate::indexer::index_folder;
+use crate::graph::{Graph, GraphDiff, NodeId};
+use crate::indexer::Indexer;
 use crate::layout::{Layout, Vec2};
+use crate::watcher::{ChangeEvent, Watcher};
 
 mod canvas;
 mod editor_prompt;
@@ -61,6 +62,17 @@ pub struct GruffApp {
     /// `None` closes the overlay and clears any search-driven dim state —
     /// the renderer keys off `is_some` rather than a separate flag.
     search: Option<SearchState>,
+    /// Stateful indexer owned by the app for the currently-loaded folder.
+    /// `None` until the first folder is opened. Stored so incremental
+    /// updates (watcher events, Cmd+R) can patch the graph in place
+    /// without re-running the full scan each time.
+    indexer: Option<Indexer>,
+    /// Filesystem watcher for the currently-loaded folder. `None` before
+    /// the first folder is opened. Dropped when a new folder replaces it.
+    watcher: Option<Watcher>,
+    /// Root of the currently-loaded folder, kept so Cmd+R can rescan the
+    /// same folder without a file picker round-trip.
+    last_root: Option<PathBuf>,
 }
 
 impl Default for GruffApp {
@@ -84,6 +96,9 @@ impl Default for GruffApp {
             config: config::load(),
             editor_prompt: None,
             search: None,
+            indexer: None,
+            watcher: None,
+            last_root: None,
         }
     }
 }
@@ -91,12 +106,75 @@ impl Default for GruffApp {
 impl GruffApp {
     fn load_folder(&mut self, path: PathBuf) {
         let start = Instant::now();
-        let result = index_folder(&path);
-        self.graph = result.graph;
-        self.unresolved_dynamic = result.unresolved_dynamic;
+        let indexer = Indexer::build(&path);
+        self.graph = indexer.graph.clone();
+        self.unresolved_dynamic = indexer.unresolved_dynamic;
+        self.last_root = Some(indexer.ws.root.clone());
+        self.indexer = Some(indexer);
 
-        // Precompute adjacency lists once per load so hit-test + sidebar
-        // rendering don't iterate all edges per frame. Sorted for stable UI.
+        self.rebuild_derived_indexes();
+        self.frame_request = None;
+        self.highlight = None;
+        // Reset the search overlay on a new folder load — the cached match
+        // set references node ids from the previous graph and would be
+        // nonsensical against the new one.
+        self.search = None;
+
+        self.layout = Layout::new();
+        self.layout.sync(&self.graph);
+        self.selected = None;
+        self.camera = Vec2::new(0.0, 0.0);
+        self.zoom = 1.0;
+        self.sim_enabled = true;
+
+        // Start (or replace) the filesystem watcher. Drop happens first so
+        // the old watcher's thread shuts down before we spawn a new one for
+        // the just-loaded folder.
+        self.watcher = None;
+        let debounce = Duration::from_millis(self.config.watch.debounce_ms);
+        if let Some(root) = self.last_root.clone() {
+            match Watcher::new(root, debounce) {
+                Ok(w) => self.watcher = Some(w),
+                Err(e) => {
+                    // Failure to start the watcher isn't fatal — the user
+                    // can still use the app, they'll just need to Cmd+R.
+                    eprintln!("watcher startup failed: {e}");
+                }
+            }
+        }
+
+        self.set_status_after_index(start.elapsed());
+    }
+
+    /// Force a full re-scan of the currently-loaded folder. The recovery
+    /// path for any drift between the live graph and disk (mirrors Cmd+R).
+    fn rescan_folder(&mut self) {
+        let Some(root) = self.last_root.clone() else {
+            return;
+        };
+        let start = Instant::now();
+        if let Some(indexer) = self.indexer.as_mut() {
+            indexer.rescan();
+            self.graph = indexer.graph.clone();
+            self.unresolved_dynamic = indexer.unresolved_dynamic;
+        } else {
+            // No indexer yet (shouldn't happen with a non-empty last_root),
+            // but fall back to a fresh build rather than a silent no-op.
+            self.load_folder(root);
+            return;
+        }
+        self.rebuild_derived_indexes();
+        self.layout.sync(&self.graph);
+        self.frame_request = None;
+        self.highlight = None;
+        self.selected = None;
+        self.set_status_after_index(start.elapsed());
+    }
+
+    /// Rebuild adjacency lists, package color indices, and cycles from the
+    /// current `self.graph`. Called after full scans and after every
+    /// non-empty incremental diff.
+    fn rebuild_derived_indexes(&mut self) {
         self.imports.clear();
         self.imported_by.clear();
         for edge in &self.graph.edges {
@@ -116,9 +194,6 @@ impl GruffApp {
             v.sort();
         }
 
-        // Assign each package a stable color index. Iterate in sorted name
-        // order so the same repo reopens with the same colors regardless of
-        // HashMap iteration order.
         self.package_indices.clear();
         let mut names: Vec<&str> = self
             .graph
@@ -133,18 +208,10 @@ impl GruffApp {
             self.package_indices.insert(name.to_string(), next);
         }
 
-        // Detect cycles once per load. Tarjan's is O(V+E) so this is cheap
-        // even on large graphs, and lets every frame look up cycle membership
-        // in O(1) via `cycle_of` rather than re-running SCC.
         self.cycles = self.graph.cycles();
-        // Sort cycle members for stable sidebar presentation. Tarjan's returns
-        // them in stack-pop order, which is deterministic per-run but visually
-        // arbitrary — alphabetical reads better in a list.
         for cycle in &mut self.cycles {
             cycle.sort();
         }
-        // Sort cycles themselves by their smallest member so the list order
-        // stays stable across reruns of the same graph.
         self.cycles
             .sort_by(|a, b| a.first().cmp(&b.first()).then(a.len().cmp(&b.len())));
         self.cycle_of.clear();
@@ -153,30 +220,18 @@ impl GruffApp {
                 self.cycle_of.insert(node.clone(), idx);
             }
         }
-        self.frame_request = None;
-        self.highlight = None;
-        // Reset the search overlay on a new folder load — the cached match
-        // set references node ids from the previous graph and would be
-        // nonsensical against the new one.
-        self.search = None;
+    }
 
-        self.layout = Layout::new();
-        self.layout.sync(&self.graph);
-        self.selected = None;
-        self.camera = Vec2::new(0.0, 0.0);
-        self.zoom = 1.0;
-        self.sim_enabled = true;
+    fn set_status_after_index(&mut self, elapsed: Duration) {
         let mut status = format!(
             "{} files, {} edges, {} cycle{} — indexed in {:.2}s",
             self.graph.nodes.len(),
             self.graph.edges.len(),
             self.cycles.len(),
             if self.cycles.len() == 1 { "" } else { "s" },
-            start.elapsed().as_secs_f32(),
+            elapsed.as_secs_f32(),
         );
         if self.unresolved_dynamic > 0 {
-            // Append rather than overwrite so the user still sees indexing
-            // metrics; the dynamic-imports note is supplementary context.
             status.push_str(&format!(
                 "  ·  {} unresolved dynamic import{}",
                 self.unresolved_dynamic,
@@ -185,6 +240,76 @@ impl GruffApp {
         }
         self.status = status;
     }
+
+    /// Drain every debounced watcher event and apply the resulting diffs to
+    /// the indexer and the live graph. Returns true if any diff was applied,
+    /// so callers can decide to refresh derived indexes / request a repaint.
+    fn pump_watcher(&mut self) -> bool {
+        let Some(watcher) = self.watcher.as_ref() else {
+            return false;
+        };
+        let events = watcher.drain();
+        if events.is_empty() {
+            return false;
+        }
+        let Some(indexer) = self.indexer.as_mut() else {
+            return false;
+        };
+
+        let mut combined = GraphDiff::default();
+        for event in events {
+            let diff = match event {
+                ChangeEvent::Touched(path) => indexer.update_file(&path),
+                ChangeEvent::Removed(path) => indexer.remove_file(&path),
+            };
+            merge_diff(&mut combined, diff);
+        }
+        if combined.is_empty() {
+            return false;
+        }
+        self.graph.apply(&combined);
+        self.unresolved_dynamic = indexer.unresolved_dynamic;
+
+        // Layout's `sync` preserves existing node positions and seeds new
+        // ones on a spiral, so the simulation absorbs the diff in place
+        // without restarting from scratch.
+        self.layout.sync(&self.graph);
+        self.rebuild_derived_indexes();
+
+        // Clear selection/highlight if the affected node is gone — stale
+        // state in the sidebar would point at nothing.
+        if let Some(selected) = self.selected.clone() {
+            if !self.graph.nodes.contains_key(&selected) {
+                self.selected = None;
+                self.highlight = None;
+            }
+        }
+
+        self.status = format!(
+            "{} files, {} edges, {} cycle{} — live",
+            self.graph.nodes.len(),
+            self.graph.edges.len(),
+            self.cycles.len(),
+            if self.cycles.len() == 1 { "" } else { "s" },
+        );
+        if self.unresolved_dynamic > 0 {
+            self.status.push_str(&format!(
+                "  ·  {} unresolved dynamic import{}",
+                self.unresolved_dynamic,
+                if self.unresolved_dynamic == 1 { "" } else { "s" },
+            ));
+        }
+        true
+    }
+}
+
+/// Append `src` into `dst`, preserving ordering (removals first, additions
+/// last so a burst of events still applies cleanly to the graph).
+fn merge_diff(dst: &mut GraphDiff, src: GraphDiff) {
+    dst.removed_edges.extend(src.removed_edges);
+    dst.removed_nodes.extend(src.removed_nodes);
+    dst.added_nodes.extend(src.added_nodes);
+    dst.added_edges.extend(src.added_edges);
 }
 
 impl eframe::App for GruffApp {
@@ -216,6 +341,22 @@ impl eframe::App for GruffApp {
             ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F));
         if search_requested && !self.graph.nodes.is_empty() {
             self.toggle_search();
+        }
+
+        // Cmd+R forces a full re-scan of the currently-loaded folder.
+        // Watcher events patch the graph incrementally; Cmd+R is the
+        // recovery path that reconciles any drift (files moved while the
+        // watcher was paused, rename storms we missed, etc.).
+        let refresh_requested =
+            ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::R));
+        if refresh_requested && self.last_root.is_some() {
+            self.rescan_folder();
+        }
+
+        // Drain and apply any filesystem changes since the previous frame.
+        // Non-blocking — returns immediately when the repo is quiet.
+        if self.pump_watcher() {
+            ctx.request_repaint();
         }
 
         // Space toggles the physics simulation (useful when it settles).

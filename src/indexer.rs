@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
 
-use crate::graph::{Graph, Node, NodeKind};
+use crate::graph::{Edge, Graph, GraphDiff, Node, NodeId, NodeKind};
 use crate::parser::{parse_file_imports, ImportKind};
 use crate::resolver::{resolve_import, ResolvedImport, ResolverContext};
 use crate::workspace::Workspace;
@@ -29,6 +29,16 @@ pub fn workspace_package_node_id(name: &str) -> String {
     format!("{WORKSPACE_PKG_ID_PREFIX}{name}")
 }
 
+/// True if `path` has a JS/TS source extension the indexer cares about.
+/// Surfaced publicly so the watcher can filter events before they reach the
+/// incremental-update path.
+pub fn is_source_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| SOURCE_EXTS.contains(&ext))
+        .unwrap_or(false)
+}
+
 /// Output of an indexing pass: the file-level dependency graph plus index-time
 /// metadata the UI needs (currently the count of fully-unresolvable dynamic
 /// imports, surfaced in the status bar).
@@ -41,25 +51,512 @@ pub struct IndexResult {
     pub unresolved_dynamic: usize,
 }
 
+/// Stateful indexer that keeps enough context alive between calls to service
+/// incremental updates. Owns the workspace handle, resolver context, graph,
+/// and the per-file import bookkeeping needed to diff a changed file without
+/// rescanning the whole repo.
+pub struct Indexer {
+    pub ws: Workspace,
+    pub ctx: ResolverContext,
+    pub graph: Graph,
+    pub unresolved_dynamic: usize,
+    /// `canonical_path → graph node id`. Populated for every file node; used
+    /// by `update_file` to locate the existing node without rescanning.
+    id_by_path: HashMap<PathBuf, NodeId>,
+    /// `canonical_path → owning package name` (`None` for unattributed files).
+    /// Cached because `owning_package` has to canonicalize + walk package
+    /// roots on every call.
+    package_of_file: HashMap<PathBuf, Option<String>>,
+    /// Per-file set of resolved imports kept in a normalized form so diffs
+    /// against a freshly-parsed set are a plain `HashSet::difference`. The
+    /// `ImportTarget` enum collapses "zero or more `ResolvedImport`" into a
+    /// hashable form.
+    imports_by_file: HashMap<PathBuf, HashSet<ImportTarget>>,
+    /// For each external package, how many files currently import it. Lets
+    /// `update_file` and `remove_file` drop the synthetic external leaf and
+    /// its aggregated edge when the refcount hits zero.
+    external_refs: HashMap<String, usize>,
+    /// For each (workspace_pkg, external_pkg) pair, how many file imports
+    /// currently contribute to the aggregated edge. Used to remove the
+    /// aggregated edge when its refcount drops to zero.
+    aggregated_refs: HashMap<(String, String), usize>,
+    /// Count of file edges per (from_file, to_file) pair. A workspace file
+    /// can reference another file through both a static import and a
+    /// re-export; we want exactly one graph edge, and the refcount lets us
+    /// remove it only when the last contributing import goes away.
+    file_edge_refs: HashMap<(NodeId, NodeId), usize>,
+    /// Per-file count of unresolvable dynamic imports. Kept so that when a
+    /// file is reindexed the running `unresolved_dynamic` total can be
+    /// decremented by the file's prior contribution before adding the new.
+    file_unresolved: HashMap<PathBuf, usize>,
+}
+
+/// Canonicalized form of what a file imports, used as the key into
+/// `imports_by_file`. Collapses every resolver outcome into a hashable shape
+/// so diff-by-set works — otherwise we'd be comparing `Vec<ResolvedImport>`
+/// pairwise.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ImportTarget {
+    /// Resolved to a workspace file — key is the target's canonical path.
+    File(PathBuf),
+    /// Resolved to an external package (by name only).
+    External(String),
+}
+
 /// Scan `root` into a `Workspace`, then index every JS/TS file under it.
 /// This is the entry point the app uses when the user drops a folder.
 pub fn index_folder(root: &Path) -> IndexResult {
-    let ws = Workspace::discover(root);
-    index_workspace(&ws)
+    let indexer = Indexer::build(root);
+    IndexResult {
+        graph: indexer.graph,
+        unresolved_dynamic: indexer.unresolved_dynamic,
+    }
 }
 
-/// Walk the workspace, parse every JS/TS file, resolve every import (static,
-/// require, dynamic, re-export), and build a file-level dependency graph with
-/// each node tagged by its owning package. Uses `ignore::WalkBuilder`, which
-/// natively respects nested `.gitignore` files, `.ignore`, `.git/info/exclude`,
-/// and hidden-file rules — all the way down the tree, not just at the root.
-pub fn index_workspace(ws: &Workspace) -> IndexResult {
-    let mut graph = Graph::new();
-    let ctx = ResolverContext::build(ws);
-    let mut unresolved_dynamic: usize = 0;
+impl Indexer {
+    /// Full scan from a repo root. Equivalent to `index_folder` plus keeping
+    /// the state alive for subsequent [`Indexer::update_file`] calls.
+    pub fn build(root: &Path) -> Self {
+        let ws = Workspace::discover(root);
+        Self::from_workspace(ws)
+    }
 
-    let mut files: Vec<PathBuf> = Vec::new();
-    let walker = WalkBuilder::new(&ws.root)
+    /// Build from an already-discovered workspace. Separated out so tests can
+    /// feed a synthetic workspace directly.
+    pub fn from_workspace(ws: Workspace) -> Self {
+        let ctx = ResolverContext::build(&ws);
+        let mut indexer = Indexer {
+            ws,
+            ctx,
+            graph: Graph::new(),
+            unresolved_dynamic: 0,
+            id_by_path: HashMap::new(),
+            package_of_file: HashMap::new(),
+            imports_by_file: HashMap::new(),
+            external_refs: HashMap::new(),
+            aggregated_refs: HashMap::new(),
+            file_edge_refs: HashMap::new(),
+            file_unresolved: HashMap::new(),
+        };
+        indexer.full_scan();
+        indexer
+    }
+
+    /// Full scan: used by `build` at startup and by Cmd+R to recover from
+    /// drift. Resets every cached piece of state so we don't carry over
+    /// stale refcounts from a previous scan.
+    pub fn rescan(&mut self) {
+        self.ws = Workspace::discover(&self.ws.root);
+        self.ctx = ResolverContext::build(&self.ws);
+        self.graph = Graph::new();
+        self.unresolved_dynamic = 0;
+        self.id_by_path.clear();
+        self.package_of_file.clear();
+        self.imports_by_file.clear();
+        self.external_refs.clear();
+        self.aggregated_refs.clear();
+        self.file_edge_refs.clear();
+        self.file_unresolved.clear();
+        self.full_scan();
+    }
+
+    fn full_scan(&mut self) {
+        let files = collect_source_files(&self.ws.root);
+
+        for f in &files {
+            let canonical = canonicalize_or(f);
+            let id = relative_id(&self.ws.root, &canonical);
+            let label = canonical
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| id.clone());
+            let package = self.ws.owning_package(&canonical).map(|p| p.name.clone());
+            self.graph.add_node(Node {
+                id: id.clone(),
+                path: canonical.clone(),
+                label,
+                package: package.clone(),
+                kind: NodeKind::File,
+            });
+            self.id_by_path.insert(canonical.clone(), id);
+            self.package_of_file.insert(canonical, package);
+        }
+
+        for f in &files {
+            let canonical = canonicalize_or(f);
+            self.reindex_file_imports(&canonical);
+        }
+    }
+
+    /// Incremental update for a file that was created or modified on disk.
+    /// Re-parses the file, resolves its imports, and returns the minimal
+    /// diff against the current graph.
+    ///
+    /// If `path` is outside the workspace or not a source file, the diff is
+    /// empty. Applying the diff is the caller's responsibility (normally
+    /// [`Graph::apply`] on `indexer.graph` plus the live view).
+    pub fn update_file(&mut self, path: &Path) -> GraphDiff {
+        if !is_source_file(path) || !path.is_file() {
+            return GraphDiff::default();
+        }
+        let canonical = canonicalize_or(path);
+        if !canonical.starts_with(&self.ws.root) {
+            return GraphDiff::default();
+        }
+
+        let mut diff = GraphDiff::default();
+
+        // If this is a new file, materialize the node first so edges we're
+        // about to add have a valid source endpoint.
+        if !self.id_by_path.contains_key(&canonical) {
+            let id = relative_id(&self.ws.root, &canonical);
+            let label = canonical
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| id.clone());
+            let package = self.ws.owning_package(&canonical).map(|p| p.name.clone());
+            let node = Node {
+                id: id.clone(),
+                path: canonical.clone(),
+                label,
+                package: package.clone(),
+                kind: NodeKind::File,
+            };
+            self.graph.add_node(node.clone());
+            diff.added_nodes.push(node);
+            self.id_by_path.insert(canonical.clone(), id);
+            self.package_of_file.insert(canonical.clone(), package);
+        }
+
+        self.apply_import_diff_for_file(&canonical, &mut diff);
+        diff
+    }
+
+    /// Incremental update for a file that was deleted from disk. Removes the
+    /// file's node, every incoming/outgoing workspace edge, and decrements
+    /// refcounts for any external/aggregated edges it contributed to.
+    pub fn remove_file(&mut self, path: &Path) -> GraphDiff {
+        let canonical = canonicalize_or(path);
+        let Some(file_id) = self.id_by_path.remove(&canonical) else {
+            return GraphDiff::default();
+        };
+
+        let mut diff = GraphDiff::default();
+        let owning_pkg = self
+            .package_of_file
+            .remove(&canonical)
+            .flatten()
+            .unwrap_or_else(|| "(unattributed)".to_string());
+
+        // Roll back every import this file contributed to: external refs,
+        // aggregated-edge refs, and workspace file edges.
+        if let Some(prev_targets) = self.imports_by_file.remove(&canonical) {
+            for target in prev_targets {
+                self.release_import(&file_id, &owning_pkg, &target, &mut diff);
+            }
+        }
+
+        // Incoming edges from other workspace files to this one must also go.
+        // They're tracked in `file_edge_refs` — drain entries pointing at the
+        // removed id.
+        let incoming: Vec<(NodeId, NodeId)> = self
+            .file_edge_refs
+            .keys()
+            .filter(|(_, to)| to == &file_id)
+            .cloned()
+            .collect();
+        for key in incoming {
+            if let Some(count) = self.file_edge_refs.remove(&key) {
+                // Every contributing import is going away with the file;
+                // record one removed_edge regardless of refcount.
+                let _ = count;
+                diff.removed_edges.push(Edge {
+                    from: key.0.clone(),
+                    to: key.1.clone(),
+                });
+            }
+        }
+
+        self.graph.remove_node(&file_id);
+        diff.removed_nodes.push(file_id);
+        diff
+    }
+
+    /// Re-parse `canonical` and reconcile `imports_by_file` with the freshly-
+    /// parsed set. Shared by the full scan (where the "old" set is empty) and
+    /// by `update_file` (where it contains the previous imports).
+    fn reindex_file_imports(&mut self, canonical: &Path) {
+        // The full scan mutates `graph` directly inside the shared helper;
+        // the diff is written to a throwaway buffer because no caller cares.
+        let mut scratch = GraphDiff::default();
+        self.apply_import_diff_for_file(canonical, &mut scratch);
+    }
+
+    /// Core diff loop: parse `file`, resolve every import, then add/remove
+    /// refcounted edges so the graph reflects the new import set. Mutates
+    /// `self.graph` and appends to `diff` for the caller.
+    fn apply_import_diff_for_file(&mut self, file: &Path, diff: &mut GraphDiff) {
+        let from_id = match self.id_by_path.get(file) {
+            Some(id) => id.clone(),
+            None => return,
+        };
+        let owning_pkg = self
+            .package_of_file
+            .get(file)
+            .cloned()
+            .flatten()
+            .unwrap_or_else(|| "(unattributed)".to_string());
+
+        let (new_targets, new_unresolved) = self.resolve_file_imports(file);
+
+        let old_targets = self.imports_by_file.remove(file).unwrap_or_default();
+        let old_unresolved = self
+            .unresolved_by_file(file)
+            .unwrap_or(0);
+
+        for removed in old_targets.difference(&new_targets) {
+            self.release_import(&from_id, &owning_pkg, removed, diff);
+        }
+        for added in new_targets.difference(&old_targets) {
+            self.acquire_import(&from_id, &owning_pkg, added, diff);
+        }
+
+        self.imports_by_file.insert(file.to_path_buf(), new_targets);
+        self.unresolved_dynamic = self
+            .unresolved_dynamic
+            .saturating_sub(old_unresolved)
+            + new_unresolved;
+        self.set_unresolved_for_file(file, new_unresolved);
+    }
+
+    fn resolve_file_imports(&self, file: &Path) -> (HashSet<ImportTarget>, usize) {
+        let mut targets: HashSet<ImportTarget> = HashSet::new();
+        let mut unresolved: usize = 0;
+
+        for imp in parse_file_imports(file) {
+            let results = resolve_import(&self.ctx, &self.ws, file, &imp);
+            if results.is_empty() {
+                if imp.kind == ImportKind::Dynamic {
+                    unresolved += 1;
+                }
+                continue;
+            }
+            let mut produced = false;
+            for r in results {
+                match r {
+                    ResolvedImport::WorkspaceFile(target) => {
+                        let canon = canonicalize_or(&target);
+                        if self.id_by_path.contains_key(&canon) {
+                            targets.insert(ImportTarget::File(canon));
+                            produced = true;
+                        }
+                    }
+                    ResolvedImport::External(pkg) => {
+                        targets.insert(ImportTarget::External(pkg));
+                        produced = true;
+                    }
+                    ResolvedImport::Unresolved => {}
+                }
+            }
+            if !produced && imp.kind == ImportKind::Dynamic {
+                unresolved += 1;
+            }
+        }
+
+        (targets, unresolved)
+    }
+
+    /// Record the newly-added import and mutate `graph` + `diff` to match.
+    /// Workspace-file targets contribute to `file_edge_refs`; external
+    /// targets contribute to `external_refs` + `aggregated_refs`.
+    fn acquire_import(
+        &mut self,
+        from_id: &NodeId,
+        owning_pkg: &str,
+        target: &ImportTarget,
+        diff: &mut GraphDiff,
+    ) {
+        match target {
+            ImportTarget::File(to_canon) => {
+                let Some(to_id) = self.id_by_path.get(to_canon).cloned() else {
+                    return;
+                };
+                let key = (from_id.clone(), to_id.clone());
+                let count = self.file_edge_refs.entry(key).or_insert(0);
+                *count += 1;
+                if *count == 1 {
+                    self.graph.add_edge(from_id, &to_id);
+                    diff.added_edges.push(Edge {
+                        from: from_id.clone(),
+                        to: to_id,
+                    });
+                }
+            }
+            ImportTarget::External(pkg) => {
+                // Ensure the external leaf exists.
+                let ext_id = external_node_id(pkg);
+                let ext_count = self.external_refs.entry(pkg.clone()).or_insert(0);
+                *ext_count += 1;
+                if *ext_count == 1 {
+                    let node = Node {
+                        id: ext_id.clone(),
+                        path: PathBuf::from(pkg),
+                        label: pkg.clone(),
+                        package: None,
+                        kind: NodeKind::External,
+                    };
+                    self.graph.add_node(node.clone());
+                    diff.added_nodes.push(node);
+                }
+
+                // Ensure the workspace-package aggregator exists.
+                let ws_id = workspace_package_node_id(owning_pkg);
+                if !self.graph.nodes.contains_key(&ws_id) {
+                    let node = Node {
+                        id: ws_id.clone(),
+                        path: PathBuf::from(owning_pkg),
+                        label: owning_pkg.to_string(),
+                        package: Some(owning_pkg.to_string()),
+                        kind: NodeKind::WorkspacePackage,
+                    };
+                    self.graph.add_node(node.clone());
+                    diff.added_nodes.push(node);
+                }
+
+                let agg_key = (owning_pkg.to_string(), pkg.clone());
+                let agg_count = self.aggregated_refs.entry(agg_key.clone()).or_insert(0);
+                *agg_count += 1;
+                if *agg_count == 1 {
+                    self.graph.add_edge(&ws_id, &ext_id);
+                    diff.added_edges.push(Edge {
+                        from: ws_id,
+                        to: ext_id,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Release (decrement-and-maybe-remove) a previously-held import. The
+    /// inverse of `acquire_import` — when the last reference to an external
+    /// package or aggregated edge goes, its synthetic node/edge is removed
+    /// from the graph and emitted in the diff.
+    fn release_import(
+        &mut self,
+        from_id: &NodeId,
+        owning_pkg: &str,
+        target: &ImportTarget,
+        diff: &mut GraphDiff,
+    ) {
+        match target {
+            ImportTarget::File(to_canon) => {
+                let Some(to_id) = self.id_by_path.get(to_canon).cloned() else {
+                    return;
+                };
+                let key = (from_id.clone(), to_id.clone());
+                let Some(count) = self.file_edge_refs.get_mut(&key) else {
+                    return;
+                };
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.file_edge_refs.remove(&key);
+                    let edge = Edge {
+                        from: from_id.clone(),
+                        to: to_id,
+                    };
+                    self.graph.edges.retain(|e| e != &edge);
+                    diff.removed_edges.push(edge);
+                }
+            }
+            ImportTarget::External(pkg) => {
+                let agg_key = (owning_pkg.to_string(), pkg.clone());
+                if let Some(agg) = self.aggregated_refs.get_mut(&agg_key) {
+                    *agg = agg.saturating_sub(1);
+                    if *agg == 0 {
+                        self.aggregated_refs.remove(&agg_key);
+                        let ws_id = workspace_package_node_id(owning_pkg);
+                        let ext_id = external_node_id(pkg);
+                        let edge = Edge {
+                            from: ws_id.clone(),
+                            to: ext_id.clone(),
+                        };
+                        self.graph.edges.retain(|e| e != &edge);
+                        diff.removed_edges.push(edge);
+
+                        // Drop the aggregator if it no longer has any
+                        // outgoing aggregated edges.
+                        let still_used = self
+                            .aggregated_refs
+                            .keys()
+                            .any(|(p, _)| p == owning_pkg);
+                        if !still_used && self.graph.nodes.contains_key(&ws_id) {
+                            self.graph.remove_node(&ws_id);
+                            diff.removed_nodes.push(ws_id);
+                        }
+                    }
+                }
+
+                if let Some(ext_count) = self.external_refs.get_mut(pkg) {
+                    *ext_count = ext_count.saturating_sub(1);
+                    if *ext_count == 0 {
+                        self.external_refs.remove(pkg);
+                        let ext_id = external_node_id(pkg);
+                        if self.graph.nodes.contains_key(&ext_id) {
+                            self.graph.remove_node(&ext_id);
+                            diff.removed_nodes.push(ext_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Count of unresolvable dynamic imports currently attributed to `file`.
+    /// Derived by rescanning the file's imports — we don't persist per-file
+    /// counts separately because they're cheap to recompute and it keeps the
+    /// state footprint smaller.
+    fn unresolved_by_file(&self, _file: &Path) -> Option<usize> {
+        // Track per-file unresolved counts implicitly via `file_unresolved`.
+        // This helper exists so the control flow in `apply_import_diff_for_file`
+        // reads naturally even though the count is computed lazily elsewhere.
+        self.file_unresolved.get(_file).copied()
+    }
+
+    fn set_unresolved_for_file(&mut self, file: &Path, count: usize) {
+        if count == 0 {
+            self.file_unresolved.remove(file);
+        } else {
+            self.file_unresolved.insert(file.to_path_buf(), count);
+        }
+    }
+}
+
+// --- helpers ---------------------------------------------------------------
+
+fn canonicalize_or(p: &Path) -> PathBuf {
+    // Direct canonicalize handles the common case (file exists on disk).
+    if let Ok(c) = p.canonicalize() {
+        return c;
+    }
+    // File may have just been deleted (relevant to watcher-driven removes).
+    // Canonicalize the parent and re-join so callers that store by canonical
+    // path can still find the entry by the raw notify event path.
+    if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
+        if let Ok(cp) = parent.canonicalize() {
+            return cp.join(name);
+        }
+    }
+    p.to_path_buf()
+}
+
+fn relative_id(root: &Path, canonical: &Path) -> NodeId {
+    let rel = canonical.strip_prefix(root).unwrap_or(canonical);
+    rel.to_string_lossy().replace('\\', "/")
+}
+
+fn collect_source_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let walker = WalkBuilder::new(root)
         .follow_links(false)
         // `WalkBuilder` only honors `.gitignore` inside an actual git repo by
         // default; `require_git(false)` makes the rules apply universally,
@@ -71,152 +568,11 @@ pub fn index_workspace(ws: &Workspace) -> IndexResult {
         .build();
     for entry in walker.filter_map(Result::ok) {
         let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-            continue;
-        };
-        if !SOURCE_EXTS.contains(&ext) {
-            continue;
-        }
-        files.push(path.to_path_buf());
-    }
-
-    let mut id_by_path: HashMap<PathBuf, String> = HashMap::new();
-    let mut package_of_file: HashMap<PathBuf, Option<String>> = HashMap::new();
-    for f in &files {
-        let canonical = f.canonicalize().unwrap_or_else(|_| f.clone());
-        let rel = canonical
-            .strip_prefix(&ws.root)
-            .unwrap_or(&canonical)
-            .to_path_buf();
-        let id = rel.to_string_lossy().replace('\\', "/");
-        let label = canonical
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| id.clone());
-        let package = ws.owning_package(&canonical).map(|p| p.name.clone());
-        graph.add_node(Node {
-            id: id.clone(),
-            path: canonical.clone(),
-            label,
-            package: package.clone(),
-            kind: NodeKind::File,
-        });
-        id_by_path.insert(canonical.clone(), id);
-        package_of_file.insert(canonical, package);
-    }
-
-    // Track which external packages we've already added as nodes so we create
-    // exactly one `External` node per distinct package name across the whole
-    // graph, no matter how many workspace files import it.
-    let mut external_added: HashSet<String> = HashSet::new();
-    // Workspace-package aggregator nodes are created lazily — only for
-    // packages that actually import externals, so repos with no external
-    // dependencies don't get extra clutter in the graph.
-    let mut workspace_pkg_added: HashSet<String> = HashSet::new();
-    // `add_edge` is already idempotent, but we still track (pkg, external)
-    // pairs explicitly so aggregation is obvious from reading the code.
-    let mut aggregated_edges: HashSet<(String, String)> = HashSet::new();
-
-    for f in &files {
-        let from_canonical = f.canonicalize().unwrap_or_else(|_| f.clone());
-        let Some(from_id) = id_by_path.get(&from_canonical).cloned() else {
-            continue;
-        };
-        let owning_pkg = package_of_file
-            .get(&from_canonical)
-            .cloned()
-            .flatten();
-
-        for imp in parse_file_imports(&from_canonical) {
-            let results = resolve_import(&ctx, ws, &from_canonical, &imp);
-
-            // A `Dynamic` import whose source can't be statically pinned down
-            // produces an empty result vec. Count it once and move on so the
-            // status bar can surface the missing-edge total.
-            if results.is_empty() {
-                if imp.kind == ImportKind::Dynamic {
-                    unresolved_dynamic += 1;
-                }
-                continue;
-            }
-
-            // Track whether at least one result for this dynamic import landed
-            // somewhere usable. If every result is `Unresolved`, the dynamic
-            // import contributed no edges and should be counted.
-            let mut produced_edge = false;
-
-            for resolved in results {
-                match resolved {
-                    ResolvedImport::WorkspaceFile(target) => {
-                        let resolved_canonical = target.canonicalize().unwrap_or(target);
-                        if let Some(to_id) = id_by_path.get(&resolved_canonical) {
-                            graph.add_edge(&from_id, to_id);
-                            produced_edge = true;
-                        }
-                    }
-                    ResolvedImport::External(pkg_name) => {
-                        // Source endpoint: the workspace-package aggregator. Fall
-                        // back to a stable synthetic name when the file isn't
-                        // attributed to any package so orphaned imports still get
-                        // aggregated (and don't fan out to the external node).
-                        let source_pkg = owning_pkg
-                            .clone()
-                            .unwrap_or_else(|| "(unattributed)".to_string());
-
-                        let ext_id = external_node_id(&pkg_name);
-                        if external_added.insert(pkg_name.clone()) {
-                            graph.add_node(Node {
-                                id: ext_id.clone(),
-                                // Externals don't have an on-disk path we care
-                                // about — use the bare package name as a marker so
-                                // the editor-open affordance doesn't try to cd
-                                // into node_modules.
-                                path: PathBuf::from(&pkg_name),
-                                label: pkg_name.clone(),
-                                // Externals don't belong to a workspace package;
-                                // leaving this `None` also keeps them out of the
-                                // layout's clustering force.
-                                package: None,
-                                kind: NodeKind::External,
-                            });
-                        }
-
-                        let ws_pkg_id = workspace_package_node_id(&source_pkg);
-                        if workspace_pkg_added.insert(source_pkg.clone()) {
-                            graph.add_node(Node {
-                                id: ws_pkg_id.clone(),
-                                path: PathBuf::from(&source_pkg),
-                                label: source_pkg.clone(),
-                                // Tag the aggregator with its own package name so
-                                // the layout's clustering force pulls it into the
-                                // same cluster as its files.
-                                package: Some(source_pkg.clone()),
-                                kind: NodeKind::WorkspacePackage,
-                            });
-                        }
-
-                        if aggregated_edges.insert((source_pkg.clone(), pkg_name.clone())) {
-                            graph.add_edge(&ws_pkg_id, &ext_id);
-                        }
-                        produced_edge = true;
-                    }
-                    ResolvedImport::Unresolved => {}
-                }
-            }
-
-            if !produced_edge && imp.kind == ImportKind::Dynamic {
-                unresolved_dynamic += 1;
-            }
+        if path.is_file() && is_source_file(path) {
+            files.push(path.to_path_buf());
         }
     }
-
-    IndexResult {
-        graph,
-        unresolved_dynamic,
-    }
+    files
 }
 
 #[cfg(test)]
@@ -346,9 +702,6 @@ mod tests {
 
     #[test]
     fn scoped_and_subpath_externals_collapse_to_package_name() {
-        // `@scope/pkg/deep` and `lodash/fp` must both resolve to the package
-        // portion only, producing a single leaf per package regardless of the
-        // subpath used to import it.
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("yarn.lock"), "").unwrap();
         fs::write(
@@ -377,16 +730,11 @@ mod tests {
             .collect();
         assert!(externals.contains(&"@scope/pkg".to_string()));
         assert!(externals.contains(&"lodash".to_string()));
-        // Exactly two distinct external packages — subpath variants must not
-        // produce separate nodes.
         assert_eq!(externals.len(), 2);
     }
 
     #[test]
     fn external_edge_aggregated_per_workspace_package() {
-        // Two workspace packages, each with two files importing `react`.
-        // Expectation: exactly two aggregated edges to the `react` node —
-        // one per importing workspace package.
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("yarn.lock"), "").unwrap();
         fs::write(
@@ -441,8 +789,6 @@ mod tests {
 
     #[test]
     fn repo_without_externals_has_no_workspace_package_nodes() {
-        // Aggregator nodes are created lazily. A repo that only uses relative
-        // imports must not sprout synthetic package nodes.
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("package.json"), r#"{"name":"solo"}"#).unwrap();
         fs::write(dir.path().join("a.ts"), r#"import { b } from "./b";"#).unwrap();
@@ -460,7 +806,6 @@ mod tests {
 
     #[test]
     fn tags_files_with_owning_package() {
-        // Two workspace packages — each file must carry its owning package name.
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("yarn.lock"), "").unwrap();
         fs::write(
@@ -493,12 +838,10 @@ mod tests {
         assert!(packages.contains(&"@org/b".to_string()));
     }
 
-    // --- new import-mode coverage ----------------------------------------
+    // --- import-mode coverage --------------------------------------------
 
     #[test]
     fn require_creates_workspace_edge() {
-        // CommonJS `require("./b")` must produce the same edge as the static
-        // ES form — the graph is module-style agnostic.
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join("a.js"),
@@ -514,8 +857,6 @@ mod tests {
 
     #[test]
     fn re_export_creates_workspace_edge() {
-        // Barrel files (`export * from './foo'`) appear as legitimate
-        // intermediaries in the graph — the re-export hop is an edge.
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join("index.ts"),
@@ -581,7 +922,6 @@ mod tests {
         .unwrap();
         let result = index_folder(dir.path());
         assert_eq!(result.unresolved_dynamic, 1);
-        // No bogus edges from the unresolvable import.
         assert!(result.graph.edges.is_empty());
     }
 
@@ -613,8 +953,6 @@ mod tests {
         .unwrap();
 
         let g = index_folder(dir.path()).graph;
-        // An edge from apps/web/src/index.ts → packages/shared/src/utils.ts
-        // confirms the alias resolved through the root tsconfig.
         let has_alias_edge = g
             .edges
             .iter()
@@ -658,5 +996,170 @@ mod tests {
             .any(|e| e.from.ends_with("packages/web/src/main.ts")
                 && e.to.ends_with("packages/shared/src/index.ts"));
         assert!(has_ws_edge, "missing workspace edge in {:?}", g.edges);
+    }
+
+    // --- incremental update --------------------------------------------------
+
+    #[test]
+    fn update_file_adds_new_import_edge() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.ts"), "").unwrap();
+        fs::write(dir.path().join("b.ts"), "").unwrap();
+
+        let mut indexer = Indexer::build(dir.path());
+        assert!(indexer.graph.edges.is_empty());
+
+        // Add an import from a.ts → b.ts and reindex just a.ts.
+        fs::write(
+            dir.path().join("a.ts"),
+            r#"import { b } from "./b";"#,
+        )
+        .unwrap();
+        let diff = indexer.update_file(&dir.path().join("a.ts"));
+
+        assert_eq!(diff.added_edges.len(), 1);
+        assert_eq!(diff.removed_edges.len(), 0);
+        assert_eq!(indexer.graph.edges.len(), 1);
+    }
+
+    #[test]
+    fn update_file_removes_deleted_import_edge() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("a.ts"),
+            r#"import { b } from "./b";"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("b.ts"), "").unwrap();
+
+        let mut indexer = Indexer::build(dir.path());
+        assert_eq!(indexer.graph.edges.len(), 1);
+
+        // Remove the import from a.ts and reindex.
+        fs::write(dir.path().join("a.ts"), "").unwrap();
+        let diff = indexer.update_file(&dir.path().join("a.ts"));
+
+        assert_eq!(diff.removed_edges.len(), 1);
+        assert!(indexer.graph.edges.is_empty());
+    }
+
+    #[test]
+    fn update_file_adds_node_for_new_file() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.ts"), "").unwrap();
+
+        let mut indexer = Indexer::build(dir.path());
+        assert_eq!(indexer.graph.nodes.len(), 1);
+
+        // Creating a new file and notifying the indexer.
+        fs::write(
+            dir.path().join("b.ts"),
+            r#"import { a } from "./a";"#,
+        )
+        .unwrap();
+        let diff = indexer.update_file(&dir.path().join("b.ts"));
+
+        assert_eq!(diff.added_nodes.len(), 1);
+        assert_eq!(diff.added_edges.len(), 1);
+        assert_eq!(indexer.graph.nodes.len(), 2);
+        assert_eq!(indexer.graph.edges.len(), 1);
+    }
+
+    #[test]
+    fn remove_file_drops_node_and_incident_edges() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("a.ts"),
+            r#"import { b } from "./b";"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("b.ts"), "").unwrap();
+
+        let mut indexer = Indexer::build(dir.path());
+        assert_eq!(indexer.graph.nodes.len(), 2);
+        assert_eq!(indexer.graph.edges.len(), 1);
+
+        // Simulate b.ts being deleted. The node and incoming edge from a.ts
+        // must both go.
+        fs::remove_file(dir.path().join("b.ts")).unwrap();
+        let diff = indexer.remove_file(&dir.path().join("b.ts"));
+
+        assert_eq!(diff.removed_nodes.len(), 1);
+        assert_eq!(diff.removed_edges.len(), 1);
+        assert_eq!(indexer.graph.nodes.len(), 1);
+        assert!(indexer.graph.edges.is_empty());
+    }
+
+    #[test]
+    fn rescan_reconciles_drift() {
+        // Mirrors the Cmd+R recovery path. Two files exist at scan time; we
+        // mutate the filesystem behind the indexer's back (simulating missed
+        // events) and then rescan. The final graph must reflect disk exactly.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.ts"), r#"import {b} from "./b";"#).unwrap();
+        fs::write(dir.path().join("b.ts"), "").unwrap();
+
+        let mut indexer = Indexer::build(dir.path());
+        assert_eq!(indexer.graph.nodes.len(), 2);
+        assert_eq!(indexer.graph.edges.len(), 1);
+
+        // Drift: add a new file, remove an existing one, change an import —
+        // none of which are notified to the indexer.
+        fs::remove_file(dir.path().join("b.ts")).unwrap();
+        fs::write(dir.path().join("c.ts"), "").unwrap();
+        fs::write(dir.path().join("a.ts"), r#"import {c} from "./c";"#).unwrap();
+
+        indexer.rescan();
+        assert_eq!(indexer.graph.nodes.len(), 2);
+        assert_eq!(indexer.graph.edges.len(), 1);
+        let labels: std::collections::HashSet<_> =
+            indexer.graph.nodes.values().map(|n| n.label.clone()).collect();
+        assert!(labels.contains("a.ts"));
+        assert!(labels.contains("c.ts"));
+        assert!(!labels.contains("b.ts"));
+    }
+
+    #[test]
+    fn update_external_add_and_remove_adjusts_synthetic_nodes() {
+        // Adding the first import of `react` should create both the external
+        // leaf and the workspace-package aggregator. Removing the last import
+        // of `react` should drop both.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("yarn.lock"), "").unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"@org/app"}"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("a.ts"), "").unwrap();
+
+        let mut indexer = Indexer::build(dir.path());
+        assert_eq!(
+            indexer.graph.nodes.values().filter(|n| matches!(n.kind, NodeKind::External)).count(),
+            0
+        );
+
+        // Add the import.
+        fs::write(
+            dir.path().join("a.ts"),
+            r#"import React from "react";"#,
+        )
+        .unwrap();
+        let diff = indexer.update_file(&dir.path().join("a.ts"));
+        // One external node + one workspace-pkg aggregator + one edge.
+        assert_eq!(diff.added_nodes.len(), 2);
+        assert_eq!(diff.added_edges.len(), 1);
+
+        // Remove it again.
+        fs::write(dir.path().join("a.ts"), "").unwrap();
+        let diff = indexer.update_file(&dir.path().join("a.ts"));
+        assert!(diff.removed_edges.len() >= 1);
+        // After removal the external leaf and aggregator should be gone.
+        let has_external = indexer
+            .graph
+            .nodes
+            .values()
+            .any(|n| matches!(n.kind, NodeKind::External));
+        assert!(!has_external, "external react leaf should be dropped");
     }
 }
