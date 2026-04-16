@@ -1,4 +1,5 @@
 pub mod app;
+pub mod camera;
 pub mod colors;
 pub mod config;
 pub mod editor;

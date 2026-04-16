@@ -4,13 +4,14 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
+use crate::camera::Camera;
 use crate::colors;
 use crate::config::{self, Config};
 use crate::error::{self, GruffError};
 use crate::export;
 use crate::graph::{Graph, GraphDiff, NodeId};
 use crate::indexer::Indexer;
-use crate::layout::{Layout, Vec2};
+use crate::layout::Layout;
 use crate::watcher::{ChangeEvent, Watcher};
 
 mod canvas;
@@ -23,6 +24,15 @@ mod status_bar;
 use editor_prompt::EditorPromptState;
 use highlight::PathHighlight;
 use search::SearchState;
+
+/// How the pending "fit all visible nodes" request should land — snap
+/// immediately (folder load, where there's nothing to animate from) or
+/// tween smoothly (the `F` shortcut, where the user has a prior view).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FitMode {
+    Snap,
+    Tween,
+}
 
 pub struct GruffApp {
     graph: Graph,
@@ -47,13 +57,18 @@ pub struct GruffApp {
     /// Deferred "frame this cycle in the viewport" request set by the sidebar
     /// and consumed by `draw_canvas` (which has the screen rect in hand).
     frame_request: Option<usize>,
+    /// Deferred "fit the full graph into the viewport" request — produced by
+    /// folder-load (snap) and the `F` shortcut (tween), consumed by
+    /// `draw_canvas` once the canvas rect is known.
+    fit_request: Option<FitMode>,
     /// Currently-highlighted dependency chain (set by clicking an edge),
     /// `None` when no chain is highlighted. Selecting a node or clicking
     /// empty canvas clears it.
     highlight: Option<PathHighlight>,
     selected: Option<NodeId>,
-    camera: Vec2,
-    zoom: f32,
+    /// Current + target viewport transform + tween state. All camera math
+    /// lives in the `camera` module; this struct just carries the state.
+    camera: Camera,
     sim_enabled: bool,
     status: String,
     /// Count of fully-unresolvable dynamic imports (e.g. `import(modName)`)
@@ -97,10 +112,10 @@ impl Default for GruffApp {
             cycles: Vec::new(),
             cycle_of: HashMap::new(),
             frame_request: None,
+            fit_request: None,
             highlight: None,
             selected: None,
-            camera: Vec2::new(0.0, 0.0),
-            zoom: 1.0,
+            camera: Camera::new(),
             sim_enabled: true,
             status: String::new(),
             unresolved_dynamic: 0,
@@ -164,8 +179,10 @@ impl GruffApp {
         self.layout = Layout::new();
         self.layout.sync(&self.graph);
         self.selected = None;
-        self.camera = Vec2::new(0.0, 0.0);
-        self.zoom = 1.0;
+        self.camera = Camera::new();
+        // Fit to the full graph on first frame after load. Snap rather than
+        // tween — there's no prior view to animate from.
+        self.fit_request = Some(FitMode::Snap);
         self.sim_enabled = true;
 
         // Start (or replace) the filesystem watcher. Drop happens first so
@@ -515,6 +532,22 @@ impl eframe::App for GruffApp {
         // search box doesn't pause physics.
         if self.search.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Space)) {
             self.sim_enabled = !self.sim_enabled;
+        }
+
+        // Bare `F` refits the viewport to the currently-visible graph.
+        // Gated on no overlays being open so typing `f` in the search box
+        // doesn't pull the rug out. The `!command && !ctrl` guards keep
+        // this shortcut from swallowing Cmd+F (search) or Ctrl+F.
+        let fit_requested = self.search.is_none()
+            && self.editor_prompt.is_none()
+            && ctx.input(|i| {
+                !i.modifiers.command
+                    && !i.modifiers.ctrl
+                    && !i.modifiers.alt
+                    && i.key_pressed(egui::Key::F)
+            });
+        if fit_requested && !self.layout.is_empty() {
+            self.fit_request = Some(FitMode::Tween);
         }
 
         // Escape deselects, or dismisses whichever overlay is open. Priority:

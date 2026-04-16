@@ -2,16 +2,26 @@ use std::collections::HashSet;
 
 use eframe::egui;
 
+use crate::camera::Bbox;
 use crate::colors;
 use crate::graph::{NodeId, NodeKind};
 use crate::layout::Vec2;
 
-use super::GruffApp;
+use super::{FitMode, GruffApp};
 
 /// Click tolerance for edge hit-testing, in screen pixels. Set wider than the
 /// edge stroke width so clicks near a thin 1 px line still land — trackpads
 /// and mice jitter a few pixels per click.
 const EDGE_HIT_PX: f32 = 6.0;
+
+/// World-space margin around a fit's bounding box. Additive (not
+/// multiplicative) so a single-node or self-loop bbox still gets visible
+/// breathing room instead of collapsing to zero padding.
+const FIT_PADDING: f32 = 60.0;
+
+/// Half-life of the camera tween animation in seconds. Short enough to feel
+/// immediate, long enough to read as motion rather than a jump cut.
+const CAMERA_TWEEN_HALF_LIFE: f32 = 0.12;
 
 impl GruffApp {
     /// True when this edge lies inside a cyclic SCC. An edge `(u,v)` is on a
@@ -26,42 +36,42 @@ impl GruffApp {
     }
 
     /// Center and zoom the viewport so cycle `idx`'s members fit inside the
-    /// canvas rect with a comfortable margin. Self-loop cycles (single node,
-    /// zero-size bbox) are handled by falling back to a generous fixed zoom.
+    /// canvas rect with a comfortable margin. Delegates the math to
+    /// `Camera::fit` and snaps — cycle framing is an instant jump, not a
+    /// tween, to match the established behavior.
     fn frame_cycle(&mut self, idx: usize, rect: egui::Rect) {
         let Some(cycle) = self.cycles.get(idx) else {
             return;
         };
-        let mut positions = cycle.iter().filter_map(|id| self.layout.get(id));
-        let Some(first) = positions.next() else {
+        let Some(bbox) =
+            Bbox::from_points(cycle.iter().filter_map(|id| self.layout.get(id)))
+        else {
             return;
         };
-        let (mut min_x, mut max_x, mut min_y, mut max_y) = (first.x, first.x, first.y, first.y);
-        for p in positions {
-            min_x = min_x.min(p.x);
-            max_x = max_x.max(p.x);
-            min_y = min_y.min(p.y);
-            max_y = max_y.max(p.y);
-        }
-        self.camera = Vec2::new((min_x + max_x) * 0.5, (min_y + max_y) * 0.5);
+        self.camera
+            .fit(bbox, Vec2::new(rect.width(), rect.height()), FIT_PADDING);
+        self.camera.snap_to_target();
+    }
 
-        // Padding leaves breathing room around the framed cycle so nodes
-        // aren't jammed against the viewport edge. Additive (in world units)
-        // rather than multiplicative so a single self-loop doesn't collapse
-        // to zero padding.
-        const PAD: f32 = 60.0;
-        let bbox_w = (max_x - min_x) + PAD * 2.0;
-        let bbox_h = (max_y - min_y) + PAD * 2.0;
-        let fit_x = rect.width() / bbox_w.max(1.0);
-        let fit_y = rect.height() / bbox_h.max(1.0);
-        self.zoom = fit_x.min(fit_y).clamp(0.05, 20.0);
+    /// Fit the camera to every visible node's bounding box. Used by the
+    /// initial folder-load fit (snap) and the `F` shortcut (tween). A layout
+    /// with no positions is a no-op — there's nothing meaningful to fit to.
+    fn fit_all(&mut self, rect: egui::Rect, mode: FitMode) {
+        let Some(bbox) = Bbox::from_points(self.layout.iter().map(|(_, p)| p)) else {
+            return;
+        };
+        self.camera
+            .fit(bbox, Vec2::new(rect.width(), rect.height()), FIT_PADDING);
+        if matches!(mode, FitMode::Snap) {
+            self.camera.snap_to_target();
+        }
     }
 
     fn world_to_screen(&self, world: Vec2, screen_center: egui::Pos2) -> egui::Pos2 {
-        egui::pos2(
-            (world.x - self.camera.x) * self.zoom + screen_center.x,
-            (world.y - self.camera.y) * self.zoom + screen_center.y,
-        )
+        let s = self
+            .camera
+            .world_to_screen(world, Vec2::new(screen_center.x, screen_center.y));
+        egui::pos2(s.x, s.y)
     }
 
     /// Color for an unselected node. External leaves render neutral gray so
@@ -127,7 +137,7 @@ impl GruffApp {
     /// so large hubs don't swallow clicks meant for attached edges — that
     /// previously made edges entering hubs effectively unclickable.
     fn pick_node(&self, screen_pos: egui::Pos2, screen_center: egui::Pos2) -> Option<NodeId> {
-        let zoom_scale = self.zoom.clamp(0.5, 2.0);
+        let zoom_scale = self.camera.zoom().clamp(0.5, 2.0);
         let mut best: Option<(f32, NodeId)> = None;
         for (id, world) in self.layout.iter() {
             let p = self.world_to_screen(world, screen_center);
@@ -154,18 +164,30 @@ impl GruffApp {
         let rect = ui.max_rect();
         let center = rect.center();
 
-        // Consume any pending "frame this cycle" request before drawing, so
-        // the updated camera applies to this frame rather than lagging by one.
+        // Consume any pending camera requests before drawing so the updated
+        // transform applies this frame instead of lagging by one. Cycle
+        // framing wins over fit-all since it's the more specific request;
+        // in practice they're never both set at once.
         if let Some(idx) = self.frame_request.take() {
             self.frame_cycle(idx, rect);
+        }
+        if let Some(mode) = self.fit_request.take() {
+            self.fit_all(rect, mode);
+        }
+
+        // Advance any in-flight tween. `is_settled` short-circuits when
+        // current == target so this is free on frames with no animation.
+        if !self.camera.is_settled() {
+            let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
+            self.camera.step(dt, CAMERA_TWEEN_HALF_LIFE);
+            ctx.request_repaint();
         }
 
         let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
         if response.dragged() {
             let delta = response.drag_delta();
-            self.camera.x -= delta.x / self.zoom;
-            self.camera.y -= delta.y / self.zoom;
+            self.camera.pan_pixels(Vec2::new(delta.x, delta.y));
         }
 
         // Click handling: nodes take priority over edges (the hit radius is
@@ -191,11 +213,10 @@ impl GruffApp {
             let scroll_y = ctx.input(|i| i.smooth_scroll_delta.y);
             if scroll_y.abs() > f32::EPSILON {
                 let factor = (scroll_y * 0.0015).exp();
-                let world_before_x = (hover.x - center.x) / self.zoom + self.camera.x;
-                let world_before_y = (hover.y - center.y) / self.zoom + self.camera.y;
-                self.zoom = (self.zoom * factor).clamp(0.05, 20.0);
-                self.camera.x = world_before_x - (hover.x - center.x) / self.zoom;
-                self.camera.y = world_before_y - (hover.y - center.y) / self.zoom;
+                self.camera.zoom_at_pixel_offset(
+                    Vec2::new(hover.x - center.x, hover.y - center.y),
+                    factor,
+                );
             }
 
             // Pointer-hand cursor over nodes and edges signals clickability
@@ -268,7 +289,7 @@ impl GruffApp {
             painter.line_segment([a, b], egui::Stroke::new(width, color));
         }
 
-        let zoom_scale = self.zoom.clamp(0.5, 2.0);
+        let zoom_scale = self.camera.zoom().clamp(0.5, 2.0);
         for (id, pos) in self.layout.iter() {
             let p = self.world_to_screen(pos, center);
             let radius = self.node_render_radius(id, zoom_scale);
