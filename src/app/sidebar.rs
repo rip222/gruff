@@ -2,6 +2,10 @@ use eframe::egui;
 
 use crate::colors;
 use crate::graph::{NodeId, NodeKind};
+use crate::package_tree::{
+    CheckState, ExternalsBucket, FolderChild, FolderNode, PackageNode, PackageTree,
+    UnpackagedBucket, EXTERNALS_LABEL, UNPACKAGED_LABEL,
+};
 
 use super::GruffApp;
 
@@ -9,6 +13,14 @@ impl GruffApp {
     pub(super) fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
         if self.selected.is_some() {
             self.draw_selection_pane(ui);
+            ui.add_space(12.0);
+            ui.separator();
+        }
+        // Packages pane sits between Selection and Cycles per #21. Only
+        // rendered once we have something to show — otherwise an empty
+        // header still reads as clutter.
+        if !self.graph.nodes.is_empty() {
+            self.draw_packages_pane(ui);
             ui.add_space(12.0);
             ui.separator();
         }
@@ -124,6 +136,45 @@ impl GruffApp {
         }
     }
 
+    fn draw_packages_pane(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        ui.heading("Packages");
+        ui.add_space(4.0);
+
+        // Rebuild on every frame from the live graph + package color map.
+        // The tree is cheap (one pass over nodes) and staying stateless
+        // keeps the renderer in sync with incremental indexer diffs without
+        // an explicit invalidation hook.
+        let tree = PackageTree::build(&self.graph, &self.package_indices);
+        if tree.is_empty() {
+            ui.label(
+                egui::RichText::new("(no packages)")
+                    .italics()
+                    .color(colors::HINT),
+            );
+            return;
+        }
+
+        // Cap the pane's rendered height so a huge package list doesn't
+        // push Cycles off-screen — matches the ScrollArea policy used for
+        // the Cycles pane.
+        egui::ScrollArea::vertical()
+            .id_salt("packages-list")
+            .max_height(360.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for pkg in &tree.packages {
+                    draw_package_node(ui, pkg);
+                }
+                if !tree.unpackaged.files.is_empty() {
+                    draw_unpackaged_bucket(ui, &tree.unpackaged);
+                }
+                if !tree.externals.externals.is_empty() {
+                    draw_externals_bucket(ui, &tree.externals);
+                }
+            });
+    }
+
     fn draw_cycles_pane(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.heading(format!("Cycles ({})", self.cycles.len()));
@@ -168,6 +219,143 @@ impl GruffApp {
                 }
             });
     }
+}
+
+/// Render a single workspace-package subtree. The header row combines the
+/// collapsing disclosure triangle, the inert checkbox, the color swatch,
+/// and the package name; the body holds nested folders and files.
+/// Collapsed by default per the issue's acceptance criteria.
+fn draw_package_node(ui: &mut egui::Ui, pkg: &PackageNode) {
+    let id = ui.make_persistent_id(format!("pkg-tree:pkg:{}", pkg.name));
+    let state = egui::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        id,
+        false,
+    );
+    let check_id = format!("pkg-check:{}", pkg.name);
+    state
+        .show_header(ui, |ui| {
+            draw_check(ui, &check_id, pkg.check);
+            draw_color_swatch(ui, pkg.color_index);
+            ui.label(egui::RichText::new(&pkg.name).monospace());
+        })
+        .body(|ui| {
+            let salt = format!("pkg:{}", pkg.name);
+            for child in &pkg.children {
+                draw_folder_child(ui, child, &salt);
+            }
+        });
+}
+
+/// Render one child of a folder — either a nested folder (collapsible) or a
+/// file leaf row.
+fn draw_folder_child(ui: &mut egui::Ui, child: &FolderChild, parent_salt: &str) {
+    match child {
+        FolderChild::Folder(folder) => draw_folder_node(ui, folder, parent_salt),
+        FolderChild::File(file) => {
+            let id = format!("{parent_salt}:file:{}", file.id);
+            ui.horizontal(|ui| {
+                draw_check(ui, &id, file.check);
+                ui.label(egui::RichText::new(&file.label).monospace().small());
+            });
+        }
+    }
+}
+
+fn draw_folder_node(ui: &mut egui::Ui, folder: &FolderNode, parent_salt: &str) {
+    let salt = format!("{parent_salt}:folder:{}", folder.name);
+    let id = ui.make_persistent_id(format!("pkg-tree:{salt}"));
+    let state = egui::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        id,
+        false,
+    );
+    let check_id = format!("{salt}:check");
+    state
+        .show_header(ui, |ui| {
+            draw_check(ui, &check_id, folder.check);
+            ui.label(egui::RichText::new(&folder.name).monospace());
+        })
+        .body(|ui| {
+            for child in &folder.children {
+                draw_folder_child(ui, child, &salt);
+            }
+        });
+}
+
+fn draw_unpackaged_bucket(ui: &mut egui::Ui, bucket: &UnpackagedBucket) {
+    let salt = "unpackaged";
+    let id = ui.make_persistent_id("pkg-tree:unpackaged");
+    let state = egui::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        id,
+        false,
+    );
+    state
+        .show_header(ui, |ui| {
+            draw_check(ui, "unpackaged:check", bucket.check);
+            ui.label(egui::RichText::new(UNPACKAGED_LABEL).italics());
+        })
+        .body(|ui| {
+            for file in &bucket.files {
+                let id = format!("{salt}:file:{}", file.id);
+                ui.horizontal(|ui| {
+                    draw_check(ui, &id, file.check);
+                    ui.label(egui::RichText::new(&file.label).monospace().small());
+                });
+            }
+        });
+}
+
+fn draw_externals_bucket(ui: &mut egui::Ui, bucket: &ExternalsBucket) {
+    let salt = "externals";
+    let id = ui.make_persistent_id("pkg-tree:externals");
+    let state = egui::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        id,
+        false,
+    );
+    state
+        .show_header(ui, |ui| {
+            draw_check(ui, "externals:check", bucket.check);
+            ui.label(egui::RichText::new(EXTERNALS_LABEL).italics());
+        })
+        .body(|ui| {
+            for ext in &bucket.externals {
+                let id = format!("{salt}:ext:{}", ext.id);
+                ui.horizontal(|ui| {
+                    draw_check(ui, &id, ext.check);
+                    ui.label(egui::RichText::new(&ext.label).monospace().small());
+                });
+            }
+        });
+}
+
+/// Render a checkbox bound to a local so egui draws it interactively. The
+/// flip is ignored for now — visibility semantics land in #22. `CheckState`
+/// maps to a bool with `Mixed` biased to `true` so a tristate parent still
+/// reads as "mostly on".
+fn draw_check(ui: &mut egui::Ui, id: &str, state: CheckState) {
+    let mut checked = !matches!(state, CheckState::Unchecked);
+    ui.scope(|ui| {
+        ui.push_id(id, |ui| {
+            // Bind to a throwaway `bool` — toggling doesn't persist. Makes
+            // the widget interactive so the user can still click it without
+            // the app reacting (per "visible but inert" in the issue).
+            let _ = ui.checkbox(&mut checked, "");
+        });
+    });
+}
+
+/// Small color chip matching the selection pane's swatch style. `None` picks
+/// the neutral hint color so packages without a color-map entry still
+/// render a placeholder rather than a layout gap.
+fn draw_color_swatch(ui: &mut egui::Ui, color_index: Option<usize>) {
+    let color = color_index
+        .map(colors::package_color)
+        .unwrap_or(colors::HINT);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 2.0, color);
 }
 
 fn render_list(ui: &mut egui::Ui, title: &str, items: &[NodeId]) {

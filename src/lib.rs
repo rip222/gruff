@@ -10,6 +10,7 @@ pub mod graph;
 pub mod indexer;
 pub mod layout;
 pub mod node_label;
+pub mod package_tree;
 pub mod parser;
 pub mod resolver;
 pub mod search;

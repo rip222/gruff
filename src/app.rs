@@ -689,9 +689,10 @@ impl eframe::App for GruffApp {
         }
 
         // Sidebar appears whenever there's content worth showing: a current
-        // selection or at least one detected cycle. Keeping it hidden on an
-        // empty canvas preserves the onboarding-only initial screen.
-        if self.selected.is_some() || !self.cycles.is_empty() {
+        // selection, a detected cycle, or a non-empty graph (which drives
+        // the `Packages` pane introduced for issue #21). Keeping it hidden
+        // on an empty canvas preserves the onboarding-only initial screen.
+        if self.selected.is_some() || !self.cycles.is_empty() || !self.graph.nodes.is_empty() {
             egui::Panel::left("sidebar")
                 .resizable(true)
                 .default_size(280.0)
