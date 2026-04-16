@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -6,6 +6,7 @@ use eframe::egui;
 
 use crate::colors;
 use crate::config::{self, Config};
+use crate::error::{self, GruffError};
 use crate::graph::{Graph, GraphDiff, NodeId};
 use crate::indexer::Indexer;
 use crate::layout::{Layout, Vec2};
@@ -16,6 +17,7 @@ mod editor_prompt;
 mod highlight;
 mod search;
 mod sidebar;
+mod status_bar;
 
 use editor_prompt::EditorPromptState;
 use highlight::PathHighlight;
@@ -57,6 +59,9 @@ pub struct GruffApp {
     /// found during the last index. Surfaced in the status bar when nonzero
     /// so users know the graph isn't showing those edges.
     unresolved_dynamic: usize,
+    /// Session-scoped runtime failures (panic hook, watcher startup, etc.)
+    /// that don't belong to one specific file snapshot.
+    runtime_errors: VecDeque<GruffError>,
     /// User settings loaded from `~/.gruff/config.toml`. Mutated when the user
     /// picks an editor through the modal; persisted immediately on change.
     config: Config,
@@ -98,6 +103,7 @@ impl Default for GruffApp {
             sim_enabled: true,
             status: String::new(),
             unresolved_dynamic: 0,
+            runtime_errors: VecDeque::new(),
             config: config::load(),
             editor_prompt: None,
             search: None,
@@ -145,11 +151,9 @@ impl GruffApp {
         if let Some(root) = self.last_root.clone() {
             match Watcher::new(root, debounce) {
                 Ok(w) => self.watcher = Some(w),
-                Err(e) => {
-                    // Failure to start the watcher isn't fatal — the user
-                    // can still use the app, they'll just need to Cmd+R.
-                    eprintln!("watcher startup failed: {e}");
-                }
+                Err(e) => self.push_runtime_error(GruffError::WatcherStartup {
+                    message: e.to_string(),
+                }),
             }
         }
 
@@ -276,10 +280,39 @@ impl GruffApp {
             status.push_str(&format!(
                 "  ·  {} unresolved dynamic import{}",
                 self.unresolved_dynamic,
-                if self.unresolved_dynamic == 1 { "" } else { "s" },
+                if self.unresolved_dynamic == 1 {
+                    ""
+                } else {
+                    "s"
+                },
             ));
         }
         self.status = status;
+    }
+
+    fn push_runtime_error(&mut self, error: GruffError) {
+        const MAX_STATUS_ERRORS: usize = 32;
+
+        if self.runtime_errors.len() == MAX_STATUS_ERRORS {
+            self.runtime_errors.pop_front();
+        }
+        self.runtime_errors.push_back(error);
+    }
+
+    fn poll_runtime_errors(&mut self) {
+        for error in error::drain_runtime_errors() {
+            self.push_runtime_error(error);
+        }
+    }
+
+    fn current_status_errors(&self) -> Vec<GruffError> {
+        let mut errors = self
+            .indexer
+            .as_ref()
+            .map(Indexer::current_errors)
+            .unwrap_or_default();
+        errors.extend(self.runtime_errors.iter().cloned());
+        errors
     }
 
     /// Drain every debounced watcher event and apply the resulting diffs to
@@ -337,7 +370,11 @@ impl GruffApp {
             self.status.push_str(&format!(
                 "  ·  {} unresolved dynamic import{}",
                 self.unresolved_dynamic,
-                if self.unresolved_dynamic == 1 { "" } else { "s" },
+                if self.unresolved_dynamic == 1 {
+                    ""
+                } else {
+                    "s"
+                },
             ));
         }
         true
@@ -366,6 +403,7 @@ impl eframe::App for GruffApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.poll_runtime_errors();
 
         // Cmd+O (or Ctrl+O on non-mac via `modifiers.command`).
         let open_requested = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O));
@@ -378,8 +416,7 @@ impl eframe::App for GruffApp {
         // Cmd+F opens (or closes) the fuzzy-search overlay. We gate it on
         // having a loaded graph so the shortcut doesn't surface a useless
         // empty overlay on the initial onboarding screen.
-        let search_requested =
-            ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F));
+        let search_requested = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F));
         if search_requested && !self.graph.nodes.is_empty() {
             self.toggle_search();
         }
@@ -388,8 +425,7 @@ impl eframe::App for GruffApp {
         // Watcher events patch the graph incrementally; Cmd+R is the
         // recovery path that reconciles any drift (files moved while the
         // watcher was paused, rename storms we missed, etc.).
-        let refresh_requested =
-            ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::R));
+        let refresh_requested = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::R));
         if refresh_requested && self.last_root.is_some() {
             self.rescan_folder();
         }
@@ -398,6 +434,11 @@ impl eframe::App for GruffApp {
         // Non-blocking — returns immediately when the repo is quiet.
         if self.pump_watcher() {
             ctx.request_repaint();
+        }
+        if self.watcher.is_some() {
+            // The watcher and panic queue are polled from the UI thread.
+            // Keep a light heartbeat even when physics is paused.
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
 
         // Space toggles the physics simulation (useful when it settles).
@@ -453,6 +494,12 @@ impl eframe::App for GruffApp {
                 });
             });
         });
+
+        egui::Panel::bottom("status_bar")
+            .exact_size(28.0)
+            .show_inside(ui, |ui| {
+                self.draw_status_bar(ui);
+            });
 
         // Drag-and-drop: use first dropped path; if it's a file, use its parent.
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());

@@ -1,8 +1,11 @@
 use eframe::egui;
 
 use gruff::app::GruffApp;
+use gruff::error;
 
 fn main() -> eframe::Result {
+    error::install_panic_hook();
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Gruff")

@@ -46,7 +46,9 @@ impl GruffApp {
             Err(OpenError::NotFound(name)) => {
                 self.open_editor_prompt(
                     PendingEditorAction::OpenFile(path),
-                    Some(format!("Couldn't find `{name}` on your PATH. Pick another editor:")),
+                    Some(format!(
+                        "Couldn't find `{name}` on your PATH. Pick another editor:"
+                    )),
                 );
             }
             Err(OpenError::Io(e)) => {
@@ -74,7 +76,9 @@ impl GruffApp {
             Err(OpenError::NotFound(name)) => {
                 self.open_editor_prompt(
                     PendingEditorAction::RevealConfig,
-                    Some(format!("Couldn't find `{name}` on your PATH. Pick another editor:")),
+                    Some(format!(
+                        "Couldn't find `{name}` on your PATH. Pick another editor:"
+                    )),
                 );
             }
             Err(OpenError::Io(e)) => {
@@ -100,16 +104,20 @@ impl GruffApp {
         let trimmed = name.trim().to_string();
         if trimmed.is_empty() {
             if let Some(prompt) = &mut self.editor_prompt {
-                prompt.error = Some("Please enter an editor command (e.g. `code` or `vim`).".to_string());
+                prompt.error =
+                    Some("Please enter an editor command (e.g. `code` or `vim`).".to_string());
             }
             return;
         }
         self.config.editor.name = trimmed.clone();
         if let Err(e) = config::save(&self.config) {
-            self.status = format!("Saved editor choice in-memory only — couldn't write config: {e}");
+            self.status =
+                format!("Saved editor choice in-memory only — couldn't write config: {e}");
         }
 
-        let Some(prompt) = self.editor_prompt.take() else { return; };
+        let Some(prompt) = self.editor_prompt.take() else {
+            return;
+        };
         let pending = prompt.pending;
         match pending {
             PendingEditorAction::OpenFile(path) => {
@@ -123,7 +131,9 @@ impl GruffApp {
                         self.editor_prompt = Some(EditorPromptState {
                             input: trimmed,
                             pending: PendingEditorAction::OpenFile(path),
-                            error: Some(format!("Couldn't find `{n}` on your PATH. Pick another editor:")),
+                            error: Some(format!(
+                                "Couldn't find `{n}` on your PATH. Pick another editor:"
+                            )),
                         });
                     }
                     Err(OpenError::Io(e)) => {
@@ -134,30 +144,32 @@ impl GruffApp {
                     }
                 }
             }
-            PendingEditorAction::RevealConfig => {
-                match config::ensure_exists() {
-                    Ok(path) => match editor::open_in_editor(&self.config.editor.name, &path) {
-                        Ok(()) => self.status = format!("Opened {}", path.display()),
-                        Err(OpenError::NotFound(n)) => {
-                            self.editor_prompt = Some(EditorPromptState {
-                                input: trimmed,
-                                pending: PendingEditorAction::RevealConfig,
-                                error: Some(format!("Couldn't find `{n}` on your PATH. Pick another editor:")),
-                            });
-                        }
-                        Err(OpenError::Io(e)) => {
-                            self.status = format!("Failed to launch editor: {e}");
-                        }
-                        Err(OpenError::NotConfigured) => {}
-                    },
-                    Err(e) => self.status = format!("Failed to prepare config file: {e}"),
-                }
-            }
+            PendingEditorAction::RevealConfig => match config::ensure_exists() {
+                Ok(path) => match editor::open_in_editor(&self.config.editor.name, &path) {
+                    Ok(()) => self.status = format!("Opened {}", path.display()),
+                    Err(OpenError::NotFound(n)) => {
+                        self.editor_prompt = Some(EditorPromptState {
+                            input: trimmed,
+                            pending: PendingEditorAction::RevealConfig,
+                            error: Some(format!(
+                                "Couldn't find `{n}` on your PATH. Pick another editor:"
+                            )),
+                        });
+                    }
+                    Err(OpenError::Io(e)) => {
+                        self.status = format!("Failed to launch editor: {e}");
+                    }
+                    Err(OpenError::NotConfigured) => {}
+                },
+                Err(e) => self.status = format!("Failed to prepare config file: {e}"),
+            },
         }
     }
 
     pub(super) fn draw_editor_prompt(&mut self, ctx: &egui::Context) {
-        let Some(prompt) = &self.editor_prompt else { return; };
+        let Some(prompt) = &self.editor_prompt else {
+            return;
+        };
         // Lift fields out — the modal body wants `&mut self` access to apply
         // the user's choice, so we operate on a snapshot and write back at the
         // end via `self.editor_prompt`.
@@ -196,8 +208,7 @@ impl GruffApp {
                     .hint_text("e.g. code, vim, subl"),
             );
             // Submit on Enter from the text field — standard keyboard flow.
-            let enter_pressed =
-                edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let enter_pressed = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
             ui.add_space(8.0);
             ui.label(
@@ -215,12 +226,10 @@ impl GruffApp {
 
             ui.add_space(10.0);
             ui.label(
-                egui::RichText::new(
-                    "You can change this later in ~/.gruff/config.toml.",
-                )
-                .italics()
-                .color(colors::HINT)
-                .small(),
+                egui::RichText::new("You can change this later in ~/.gruff/config.toml.")
+                    .italics()
+                    .color(colors::HINT)
+                    .small(),
             );
 
             ui.add_space(10.0);

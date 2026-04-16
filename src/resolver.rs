@@ -347,7 +347,9 @@ fn resolve_tsconfig_path(
     loop {
         let candidate = current.join("tsconfig.json");
         if candidate.is_file() {
-            let canon = candidate.canonicalize().unwrap_or_else(|_| candidate.clone());
+            let canon = candidate
+                .canonicalize()
+                .unwrap_or_else(|_| candidate.clone());
             // Prefer a parse cached at workspace-discovery time; fall back to a
             // fresh parse for tsconfigs that live outside any discovered
             // package root (the spec only requires "nearest tsconfig", not
@@ -709,7 +711,10 @@ mod tests {
 
     #[test]
     fn bare_unscoped_subpath_trimmed_to_package_name() {
-        assert_eq!(bare_specifier_package("lodash/fp"), Some("lodash".to_string()));
+        assert_eq!(
+            bare_specifier_package("lodash/fp"),
+            Some("lodash".to_string())
+        );
         assert_eq!(
             bare_specifier_package("lodash/fp/get"),
             Some("lodash".to_string())
@@ -768,7 +773,10 @@ mod tests {
     fn resolve_routes_bare_to_external() {
         let dir = tempdir().unwrap();
         let from = touch(dir.path(), "src/a.ts");
-        assert_eq!(resolve(&from, "react"), ResolvedImport::External("react".to_string()));
+        assert_eq!(
+            resolve(&from, "react"),
+            ResolvedImport::External("react".to_string())
+        );
         assert_eq!(
             resolve(&from, "@scope/pkg/deep"),
             ResolvedImport::External("@scope/pkg".to_string())

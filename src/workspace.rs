@@ -194,11 +194,17 @@ fn extract_package_json_workspaces(v: &Value) -> Vec<String> {
     //   "workspaces": ["packages/*"]
     //   "workspaces": { "packages": ["packages/*"] }   (yarn classic nohoist)
     if let Some(arr) = ws.as_array() {
-        return arr.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+        return arr
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect();
     }
     if let Some(obj) = ws.as_object() {
         if let Some(pkgs) = obj.get("packages").and_then(|p| p.as_array()) {
-            return pkgs.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+            return pkgs
+                .iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect();
         }
     }
     Vec::new()
@@ -321,7 +327,11 @@ fn read_package(dir: &Path) -> Option<Package> {
         });
     let root = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let manifest = manifest.canonicalize().unwrap_or(manifest);
-    Some(Package { name, root, manifest })
+    Some(Package {
+        name,
+        root,
+        manifest,
+    })
 }
 
 #[cfg(test)]
@@ -388,9 +398,21 @@ mod tests {
             "packages:\n  - \"apps/*\"\n  - 'packages/*'\n",
         );
         write(dir.path(), "package.json", r#"{"name":"root"}"#);
-        write(dir.path(), "apps/web/package.json", r#"{"name":"@org/web"}"#);
-        write(dir.path(), "apps/api/package.json", r#"{"name":"@org/api"}"#);
-        write(dir.path(), "packages/shared/package.json", r#"{"name":"@org/shared"}"#);
+        write(
+            dir.path(),
+            "apps/web/package.json",
+            r#"{"name":"@org/web"}"#,
+        );
+        write(
+            dir.path(),
+            "apps/api/package.json",
+            r#"{"name":"@org/api"}"#,
+        );
+        write(
+            dir.path(),
+            "packages/shared/package.json",
+            r#"{"name":"@org/shared"}"#,
+        );
 
         let ws = Workspace::discover(dir.path());
         let names: HashSet<_> = ws.packages.iter().map(|p| p.name.clone()).collect();
@@ -460,13 +482,19 @@ mod tests {
     #[test]
     fn owning_package_picks_deepest_match() {
         let dir = tempdir().unwrap();
-        write(dir.path(), "package.json", r#"{"name":"root","workspaces":["packages/*"]}"#);
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"root","workspaces":["packages/*"]}"#,
+        );
         write(dir.path(), "yarn.lock", "");
         write(dir.path(), "packages/a/package.json", r#"{"name":"a"}"#);
         let file = write(dir.path(), "packages/a/src/index.ts", "");
 
         let ws = Workspace::discover(dir.path());
-        let pkg = ws.owning_package(&file).expect("should find owning package");
+        let pkg = ws
+            .owning_package(&file)
+            .expect("should find owning package");
         // Deeper package root must win over root package.
         assert_eq!(pkg.name, "a");
     }
@@ -475,7 +503,11 @@ mod tests {
     fn exposes_nested_tsconfigs() {
         let dir = tempdir().unwrap();
         write(dir.path(), "pnpm-lock.yaml", "");
-        write(dir.path(), "pnpm-workspace.yaml", "packages:\n  - packages/*\n");
+        write(
+            dir.path(),
+            "pnpm-workspace.yaml",
+            "packages:\n  - packages/*\n",
+        );
         write(dir.path(), "package.json", r#"{"name":"root"}"#);
         write(dir.path(), "tsconfig.json", r#"{}"#);
         write(dir.path(), "packages/a/package.json", r#"{"name":"a"}"#);
@@ -488,5 +520,4 @@ mod tests {
         let near = ws.tsconfig_for(&file).expect("should resolve tsconfig");
         assert!(near.to_string_lossy().contains("packages/a"));
     }
-
 }

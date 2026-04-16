@@ -1,11 +1,11 @@
 use std::path::Path;
 
-use swc_common::{sync::Lrc, FileName, SourceMap};
-use swc_ecma_ast::{
-    CallExpr, Callee, Expr, Lit, ModuleDecl, ModuleItem, Tpl,
-};
-use swc_ecma_parser::{lexer::Lexer, EsSyntax, Parser, StringInput, Syntax, TsSyntax};
+use swc_common::{FileName, SourceMap, sync::Lrc};
+use swc_ecma_ast::{CallExpr, Callee, Expr, Lit, ModuleDecl, ModuleItem, Tpl};
+use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
 use swc_ecma_visit::{Visit, VisitWith};
+
+use crate::error::GruffError;
 
 /// Discriminator for what kind of import produced an [`ImportStatement`].
 ///
@@ -58,13 +58,23 @@ impl ImportStatement {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct ParseFileResult {
+    pub imports: Vec<ImportStatement>,
+    pub error: Option<GruffError>,
+}
+
 /// Parse `src` and return every import-like reference: static `import`,
 /// `require`, dynamic `import()` (literal or template), and re-exports.
 ///
 /// `ext` picks the syntax preset (`ts`/`tsx`/`jsx`/`js`/`mjs`/`cjs`).
-/// On parse failure, returns the imports already accumulated up to that
-/// point — the AST walk is best-effort, never panics.
+/// On parse failure, returns an empty vec — the parser is best-effort and
+/// never panics the caller.
 pub fn parse_imports(src: &str, ext: &str) -> Vec<ImportStatement> {
+    parse_imports_detailed(src, ext).unwrap_or_default()
+}
+
+fn parse_imports_detailed(src: &str, ext: &str) -> Result<Vec<ImportStatement>, String> {
     let (is_ts, is_jsx) = match ext {
         "ts" => (true, false),
         "tsx" => (true, true),
@@ -86,17 +96,14 @@ pub fn parse_imports(src: &str, ext: &str) -> Vec<ImportStatement> {
     };
 
     let cm: Lrc<SourceMap> = Default::default();
-    let fm = cm.new_source_file(
-        Lrc::new(FileName::Anon),
-        src.to_string(),
-    );
+    let fm = cm.new_source_file(Lrc::new(FileName::Anon), src.to_string());
 
     let lexer = Lexer::new(syntax, Default::default(), StringInput::from(&*fm), None);
     let mut parser = Parser::new_from(lexer);
 
     let module = match parser.parse_module() {
         Ok(m) => m,
-        Err(_) => return Vec::new(),
+        Err(err) => return Err(err.kind().msg().into_owned()),
     };
 
     let mut imports = Vec::new();
@@ -128,24 +135,46 @@ pub fn parse_imports(src: &str, ext: &str) -> Vec<ImportStatement> {
         }
     }
 
-    let mut visitor = CallVisitor { imports: Vec::new() };
+    let mut visitor = CallVisitor {
+        imports: Vec::new(),
+    };
     module.visit_with(&mut visitor);
     imports.extend(visitor.imports);
 
-    imports
+    Ok(imports)
 }
 
 /// Convenience: read a file from disk and extract its imports.
-/// Returns an empty vec on read or parse error (best-effort behavior).
-pub fn parse_file_imports(path: &Path) -> Vec<ImportStatement> {
-    let Ok(src) = std::fs::read_to_string(path) else {
-        return Vec::new();
+/// Returns an empty vec on read or parse error and surfaces the failure as a
+/// structured [`GruffError`] for the status bar.
+pub fn parse_file_imports(path: &Path) -> ParseFileResult {
+    let src = match std::fs::read_to_string(path) {
+        Ok(src) => src,
+        Err(err) => {
+            return ParseFileResult {
+                imports: Vec::new(),
+                error: Some(GruffError::ReadFile {
+                    path: path.to_path_buf(),
+                    message: err.to_string(),
+                }),
+            };
+        }
     };
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("js");
-    parse_imports(&src, ext)
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("js");
+
+    match parse_imports_detailed(&src, ext) {
+        Ok(imports) => ParseFileResult {
+            imports,
+            error: None,
+        },
+        Err(message) => ParseFileResult {
+            imports: Vec::new(),
+            error: Some(GruffError::ParseFile {
+                path: path.to_path_buf(),
+                message,
+            }),
+        },
+    }
 }
 
 /// Recursive call-expression visitor that picks up `require(...)` and
@@ -247,10 +276,8 @@ impl CallVisitor {
 
         if tpl.exprs.is_empty() {
             // No interpolation — equivalent to a string literal.
-            self.imports.push(ImportStatement::literal(
-                prefix,
-                ImportKind::Dynamic,
-            ));
+            self.imports
+                .push(ImportStatement::literal(prefix, ImportKind::Dynamic));
             return;
         }
 
@@ -276,6 +303,8 @@ impl CallVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
 
     fn sources(imports: &[ImportStatement]) -> Vec<&str> {
         imports.iter().map(|i| i.source.as_str()).collect()
@@ -374,10 +403,7 @@ mod tests {
         // Static imports come first (collected from module body); require is
         // collected by the AST visitor that runs second.
         assert_eq!(sources(&imps), vec!["./bar", "./foo"]);
-        assert_eq!(
-            kinds(&imps),
-            vec![ImportKind::Static, ImportKind::Require]
-        );
+        assert_eq!(kinds(&imps), vec![ImportKind::Static, ImportKind::Require]);
     }
 
     #[test]
@@ -509,10 +535,8 @@ mod tests {
             const d = import("./d");
         "#;
         let imps = parse_imports(src, "ts");
-        let pairs: Vec<(&str, ImportKind)> = imps
-            .iter()
-            .map(|i| (i.source.as_str(), i.kind))
-            .collect();
+        let pairs: Vec<(&str, ImportKind)> =
+            imps.iter().map(|i| (i.source.as_str(), i.kind)).collect();
         assert!(pairs.contains(&("./a", ImportKind::Static)));
         assert!(pairs.contains(&("./b", ImportKind::ReExport)));
         assert!(pairs.contains(&("./c", ImportKind::Require)));
@@ -524,6 +548,20 @@ mod tests {
         // Deliberate syntax error → empty vec, no panic.
         let src = "import { from './broken'";
         assert_eq!(parse_imports(src, "ts"), Vec::<ImportStatement>::new());
+    }
+
+    #[test]
+    fn parse_file_reports_structured_error_for_malformed_source() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("broken.ts");
+        fs::write(&path, "import { from './broken'").unwrap();
+
+        let result = parse_file_imports(&path);
+        assert!(result.imports.is_empty());
+        assert!(matches!(
+            result.error,
+            Some(GruffError::ParseFile { path: err_path, .. }) if err_path == path
+        ));
     }
 
     #[test]

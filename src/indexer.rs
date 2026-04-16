@@ -3,10 +3,11 @@ use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
 
+use crate::error::GruffError;
 use crate::filters::{is_config_file, is_test_file};
 use crate::graph::{Edge, Graph, GraphDiff, Node, NodeId, NodeKind};
-use crate::parser::{parse_file_imports, ImportKind};
-use crate::resolver::{resolve_import, ResolvedImport, ResolverContext};
+use crate::parser::{ImportKind, parse_file_imports};
+use crate::resolver::{ResolvedImport, ResolverContext, resolve_import};
 use crate::workspace::Workspace;
 
 const SOURCE_EXTS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs"];
@@ -60,6 +61,9 @@ pub struct IndexResult {
     /// determined (e.g. `import(modName)`). Reported in the status bar so the
     /// user knows the graph isn't showing those edges.
     pub unresolved_dynamic: usize,
+    /// Current per-file parse/read failures. Surfaced by the status bar while
+    /// the affected file remains broken.
+    pub errors: Vec<GruffError>,
 }
 
 /// Stateful indexer that keeps enough context alive between calls to service
@@ -101,6 +105,8 @@ pub struct Indexer {
     /// file is reindexed the running `unresolved_dynamic` total can be
     /// decremented by the file's prior contribution before adding the new.
     file_unresolved: HashMap<PathBuf, usize>,
+    /// Per-file parse/read errors currently active in the graph.
+    file_errors: HashMap<PathBuf, GruffError>,
 }
 
 /// Canonicalized form of what a file imports, used as the key into
@@ -119,9 +125,11 @@ enum ImportTarget {
 /// This is the entry point the app uses when the user drops a folder.
 pub fn index_folder(root: &Path) -> IndexResult {
     let indexer = Indexer::build(root);
+    let errors = indexer.current_errors();
     IndexResult {
         graph: indexer.graph,
         unresolved_dynamic: indexer.unresolved_dynamic,
+        errors,
     }
 }
 
@@ -167,6 +175,7 @@ impl Indexer {
             aggregated_refs: HashMap::new(),
             file_edge_refs: HashMap::new(),
             file_unresolved: HashMap::new(),
+            file_errors: HashMap::new(),
         };
         indexer.full_scan();
         indexer
@@ -187,7 +196,14 @@ impl Indexer {
         self.aggregated_refs.clear();
         self.file_edge_refs.clear();
         self.file_unresolved.clear();
+        self.file_errors.clear();
         self.full_scan();
+    }
+
+    pub fn current_errors(&self) -> Vec<GruffError> {
+        let mut errors: Vec<_> = self.file_errors.values().cloned().collect();
+        errors.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+        errors
     }
 
     /// Flip the "include test files" toggle and rebuild the graph. The test-
@@ -289,6 +305,7 @@ impl Indexer {
         let Some(file_id) = self.id_by_path.remove(&canonical) else {
             return GraphDiff::default();
         };
+        self.file_errors.remove(&canonical);
 
         let mut diff = GraphDiff::default();
         let owning_pkg = self
@@ -356,12 +373,16 @@ impl Indexer {
             .flatten()
             .unwrap_or_else(|| "(unattributed)".to_string());
 
-        let (new_targets, new_unresolved) = self.resolve_file_imports(file);
+        let (new_targets, new_unresolved, file_error) = self.resolve_file_imports(file);
+
+        if let Some(error) = file_error {
+            self.file_errors.insert(file.to_path_buf(), error);
+        } else {
+            self.file_errors.remove(file);
+        }
 
         let old_targets = self.imports_by_file.remove(file).unwrap_or_default();
-        let old_unresolved = self
-            .unresolved_by_file(file)
-            .unwrap_or(0);
+        let old_unresolved = self.unresolved_by_file(file).unwrap_or(0);
 
         for removed in old_targets.difference(&new_targets) {
             self.release_import(&from_id, &owning_pkg, removed, diff);
@@ -371,18 +392,20 @@ impl Indexer {
         }
 
         self.imports_by_file.insert(file.to_path_buf(), new_targets);
-        self.unresolved_dynamic = self
-            .unresolved_dynamic
-            .saturating_sub(old_unresolved)
-            + new_unresolved;
+        self.unresolved_dynamic =
+            self.unresolved_dynamic.saturating_sub(old_unresolved) + new_unresolved;
         self.set_unresolved_for_file(file, new_unresolved);
     }
 
-    fn resolve_file_imports(&self, file: &Path) -> (HashSet<ImportTarget>, usize) {
+    fn resolve_file_imports(
+        &self,
+        file: &Path,
+    ) -> (HashSet<ImportTarget>, usize, Option<GruffError>) {
         let mut targets: HashSet<ImportTarget> = HashSet::new();
         let mut unresolved: usize = 0;
+        let parsed = parse_file_imports(file);
 
-        for imp in parse_file_imports(file) {
+        for imp in parsed.imports {
             let results = resolve_import(&self.ctx, &self.ws, file, &imp);
             if results.is_empty() {
                 if imp.kind == ImportKind::Dynamic {
@@ -412,7 +435,7 @@ impl Indexer {
             }
         }
 
-        (targets, unresolved)
+        (targets, unresolved, parsed.error)
     }
 
     /// Record the newly-added import and mutate `graph` + `diff` to match.
@@ -534,10 +557,7 @@ impl Indexer {
 
                         // Drop the aggregator if it no longer has any
                         // outgoing aggregated edges.
-                        let still_used = self
-                            .aggregated_refs
-                            .keys()
-                            .any(|(p, _)| p == owning_pkg);
+                        let still_used = self.aggregated_refs.keys().any(|(p, _)| p == owning_pkg);
                         if !still_used && self.graph.nodes.contains_key(&ws_id) {
                             self.graph.remove_node(&ws_id);
                             diff.removed_nodes.push(ws_id);
@@ -712,52 +732,31 @@ mod tests {
         // count, and exactly one edge from the package aggregator to it.
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("yarn.lock"), "").unwrap();
-        fs::write(
-            dir.path().join("package.json"),
-            r#"{"name":"@org/app"}"#,
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("a.ts"),
-            r#"import React from "react";"#,
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("b.ts"),
-            r#"import React from "react";"#,
-        )
-        .unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"name":"@org/app"}"#).unwrap();
+        fs::write(dir.path().join("a.ts"), r#"import React from "react";"#).unwrap();
+        fs::write(dir.path().join("b.ts"), r#"import React from "react";"#).unwrap();
 
         let g = index_folder(dir.path()).graph;
 
         let ext_id = external_node_id("react");
-        let react_nodes: Vec<_> = g
-            .nodes
-            .values()
-            .filter(|n| n.id == ext_id)
-            .collect();
+        let react_nodes: Vec<_> = g.nodes.values().filter(|n| n.id == ext_id).collect();
         assert_eq!(react_nodes.len(), 1);
         assert_eq!(react_nodes[0].kind, NodeKind::External);
 
-        let edges_to_react: Vec<_> = g
-            .edges
-            .iter()
-            .filter(|e| e.to == ext_id)
-            .collect();
+        let edges_to_react: Vec<_> = g.edges.iter().filter(|e| e.to == ext_id).collect();
         // One aggregated edge, even though two files import react.
         assert_eq!(edges_to_react.len(), 1);
-        assert_eq!(edges_to_react[0].from, workspace_package_node_id("@org/app"));
+        assert_eq!(
+            edges_to_react[0].from,
+            workspace_package_node_id("@org/app")
+        );
     }
 
     #[test]
     fn scoped_and_subpath_externals_collapse_to_package_name() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("yarn.lock"), "").unwrap();
-        fs::write(
-            dir.path().join("package.json"),
-            r#"{"name":"@org/app"}"#,
-        )
-        .unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"name":"@org/app"}"#).unwrap();
         fs::write(
             dir.path().join("a.ts"),
             r#"
@@ -878,11 +877,7 @@ mod tests {
         fs::write(dir.path().join("packages/b/index.ts"), "").unwrap();
 
         let g = index_folder(dir.path()).graph;
-        let packages: Vec<_> = g
-            .nodes
-            .values()
-            .filter_map(|n| n.package.clone())
-            .collect();
+        let packages: Vec<_> = g.nodes.values().filter_map(|n| n.package.clone()).collect();
         assert!(packages.contains(&"@org/a".to_string()));
         assert!(packages.contains(&"@org/b".to_string()));
     }
@@ -892,11 +887,7 @@ mod tests {
     #[test]
     fn require_creates_workspace_edge() {
         let dir = tempdir().unwrap();
-        fs::write(
-            dir.path().join("a.js"),
-            r#"const b = require("./b");"#,
-        )
-        .unwrap();
+        fs::write(dir.path().join("a.js"), r#"const b = require("./b");"#).unwrap();
         fs::write(dir.path().join("b.js"), "module.exports = 1;").unwrap();
 
         let g = index_folder(dir.path()).graph;
@@ -907,29 +898,22 @@ mod tests {
     #[test]
     fn re_export_creates_workspace_edge() {
         let dir = tempdir().unwrap();
-        fs::write(
-            dir.path().join("index.ts"),
-            r#"export * from "./foo";"#,
-        )
-        .unwrap();
+        fs::write(dir.path().join("index.ts"), r#"export * from "./foo";"#).unwrap();
         fs::write(dir.path().join("foo.ts"), "export const x = 1;").unwrap();
 
         let g = index_folder(dir.path()).graph;
         assert_eq!(g.edges.len(), 1);
-        assert!(g
-            .edges
-            .iter()
-            .any(|e| e.from == "index.ts" && e.to == "foo.ts"));
+        assert!(
+            g.edges
+                .iter()
+                .any(|e| e.from == "index.ts" && e.to == "foo.ts")
+        );
     }
 
     #[test]
     fn dynamic_import_string_creates_workspace_edge() {
         let dir = tempdir().unwrap();
-        fs::write(
-            dir.path().join("a.ts"),
-            r#"const b = import("./b");"#,
-        )
-        .unwrap();
+        fs::write(dir.path().join("a.ts"), r#"const b = import("./b");"#).unwrap();
         fs::write(dir.path().join("b.ts"), "export const x = 1;").unwrap();
 
         let result = index_folder(dir.path());
@@ -964,24 +948,53 @@ mod tests {
     #[test]
     fn truly_dynamic_import_counted_in_status() {
         let dir = tempdir().unwrap();
-        fs::write(
-            dir.path().join("a.ts"),
-            r#"const m = import(modName);"#,
-        )
-        .unwrap();
+        fs::write(dir.path().join("a.ts"), r#"const m = import(modName);"#).unwrap();
         let result = index_folder(dir.path());
         assert_eq!(result.unresolved_dynamic, 1);
         assert!(result.graph.edges.is_empty());
     }
 
     #[test]
-    fn tsconfig_paths_alias_resolves_to_workspace_file() {
+    fn malformed_file_is_skipped_but_still_appears_as_target() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("package.json"),
-            r#"{"name":"root"}"#,
+            dir.path().join("broken.ts"),
+            "import { from './still-broken'",
         )
         .unwrap();
+        fs::write(
+            dir.path().join("consumer.ts"),
+            r#"import { x } from "./broken";"#,
+        )
+        .unwrap();
+
+        let result = index_folder(dir.path());
+        assert!(
+            result
+                .graph
+                .nodes
+                .values()
+                .any(|node| node.label == "broken.ts")
+        );
+        assert!(
+            result
+                .graph
+                .edges
+                .iter()
+                .any(|edge| edge.from == "consumer.ts" && edge.to == "broken.ts")
+        );
+        assert!(result.errors.iter().any(|error| {
+            matches!(
+                error,
+                GruffError::ParseFile { path, .. } if path.ends_with("broken.ts")
+            )
+        }));
+    }
+
+    #[test]
+    fn tsconfig_paths_alias_resolves_to_workspace_file() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"name":"root"}"#).unwrap();
         fs::write(
             dir.path().join("tsconfig.json"),
             r#"{
@@ -1002,11 +1015,10 @@ mod tests {
         .unwrap();
 
         let g = index_folder(dir.path()).graph;
-        let has_alias_edge = g
-            .edges
-            .iter()
-            .any(|e| e.from.ends_with("apps/web/src/index.ts")
-                && e.to.ends_with("packages/shared/src/utils.ts"));
+        let has_alias_edge = g.edges.iter().any(|e| {
+            e.from.ends_with("apps/web/src/index.ts")
+                && e.to.ends_with("packages/shared/src/utils.ts")
+        });
         assert!(has_alias_edge, "missing alias edge in {:?}", g.edges);
     }
 
@@ -1039,11 +1051,10 @@ mod tests {
         .unwrap();
 
         let g = index_folder(dir.path()).graph;
-        let has_ws_edge = g
-            .edges
-            .iter()
-            .any(|e| e.from.ends_with("packages/web/src/main.ts")
-                && e.to.ends_with("packages/shared/src/index.ts"));
+        let has_ws_edge = g.edges.iter().any(|e| {
+            e.from.ends_with("packages/web/src/main.ts")
+                && e.to.ends_with("packages/shared/src/index.ts")
+        });
         assert!(has_ws_edge, "missing workspace edge in {:?}", g.edges);
     }
 
@@ -1059,11 +1070,7 @@ mod tests {
         assert!(indexer.graph.edges.is_empty());
 
         // Add an import from a.ts → b.ts and reindex just a.ts.
-        fs::write(
-            dir.path().join("a.ts"),
-            r#"import { b } from "./b";"#,
-        )
-        .unwrap();
+        fs::write(dir.path().join("a.ts"), r#"import { b } from "./b";"#).unwrap();
         let diff = indexer.update_file(&dir.path().join("a.ts"));
 
         assert_eq!(diff.added_edges.len(), 1);
@@ -1074,11 +1081,7 @@ mod tests {
     #[test]
     fn update_file_removes_deleted_import_edge() {
         let dir = tempdir().unwrap();
-        fs::write(
-            dir.path().join("a.ts"),
-            r#"import { b } from "./b";"#,
-        )
-        .unwrap();
+        fs::write(dir.path().join("a.ts"), r#"import { b } from "./b";"#).unwrap();
         fs::write(dir.path().join("b.ts"), "").unwrap();
 
         let mut indexer = Indexer::build(dir.path());
@@ -1101,11 +1104,7 @@ mod tests {
         assert_eq!(indexer.graph.nodes.len(), 1);
 
         // Creating a new file and notifying the indexer.
-        fs::write(
-            dir.path().join("b.ts"),
-            r#"import { a } from "./a";"#,
-        )
-        .unwrap();
+        fs::write(dir.path().join("b.ts"), r#"import { a } from "./a";"#).unwrap();
         let diff = indexer.update_file(&dir.path().join("b.ts"));
 
         assert_eq!(diff.added_nodes.len(), 1);
@@ -1117,11 +1116,7 @@ mod tests {
     #[test]
     fn remove_file_drops_node_and_incident_edges() {
         let dir = tempdir().unwrap();
-        fs::write(
-            dir.path().join("a.ts"),
-            r#"import { b } from "./b";"#,
-        )
-        .unwrap();
+        fs::write(dir.path().join("a.ts"), r#"import { b } from "./b";"#).unwrap();
         fs::write(dir.path().join("b.ts"), "").unwrap();
 
         let mut indexer = Indexer::build(dir.path());
@@ -1161,8 +1156,12 @@ mod tests {
         indexer.rescan();
         assert_eq!(indexer.graph.nodes.len(), 2);
         assert_eq!(indexer.graph.edges.len(), 1);
-        let labels: std::collections::HashSet<_> =
-            indexer.graph.nodes.values().map(|n| n.label.clone()).collect();
+        let labels: std::collections::HashSet<_> = indexer
+            .graph
+            .nodes
+            .values()
+            .map(|n| n.label.clone())
+            .collect();
         assert!(labels.contains("a.ts"));
         assert!(labels.contains("c.ts"));
         assert!(!labels.contains("b.ts"));
@@ -1175,25 +1174,22 @@ mod tests {
         // of `react` should drop both.
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("yarn.lock"), "").unwrap();
-        fs::write(
-            dir.path().join("package.json"),
-            r#"{"name":"@org/app"}"#,
-        )
-        .unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"name":"@org/app"}"#).unwrap();
         fs::write(dir.path().join("a.ts"), "").unwrap();
 
         let mut indexer = Indexer::build(dir.path());
         assert_eq!(
-            indexer.graph.nodes.values().filter(|n| matches!(n.kind, NodeKind::External)).count(),
+            indexer
+                .graph
+                .nodes
+                .values()
+                .filter(|n| matches!(n.kind, NodeKind::External))
+                .count(),
             0
         );
 
         // Add the import.
-        fs::write(
-            dir.path().join("a.ts"),
-            r#"import React from "react";"#,
-        )
-        .unwrap();
+        fs::write(dir.path().join("a.ts"), r#"import React from "react";"#).unwrap();
         let diff = indexer.update_file(&dir.path().join("a.ts"));
         // One external node + one workspace-pkg aggregator + one edge.
         assert_eq!(diff.added_nodes.len(), 2);
@@ -1236,40 +1232,26 @@ mod tests {
         // setter does the work.
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("a.ts"), "").unwrap();
-        fs::write(
-            dir.path().join("a.test.ts"),
-            r#"import { a } from "./a";"#,
-        )
-        .unwrap();
+        fs::write(dir.path().join("a.test.ts"), r#"import { a } from "./a";"#).unwrap();
 
         let mut indexer = Indexer::build(dir.path());
-        assert!(!indexer
-            .graph
-            .nodes
-            .values()
-            .any(|n| n.label == "a.test.ts"));
+        assert!(!indexer.graph.nodes.values().any(|n| n.label == "a.test.ts"));
 
         indexer.set_include_tests(true);
-        assert!(indexer
-            .graph
-            .nodes
-            .values()
-            .any(|n| n.label == "a.test.ts"));
+        assert!(indexer.graph.nodes.values().any(|n| n.label == "a.test.ts"));
         // The edge from the test file into the production file should also
         // appear, because the rescan reparsed it.
-        assert!(indexer
-            .graph
-            .edges
-            .iter()
-            .any(|e| e.from.ends_with("a.test.ts") && e.to.ends_with("a.ts")));
+        assert!(
+            indexer
+                .graph
+                .edges
+                .iter()
+                .any(|e| e.from.ends_with("a.test.ts") && e.to.ends_with("a.ts"))
+        );
 
         // Toggling off again removes them.
         indexer.set_include_tests(false);
-        assert!(!indexer
-            .graph
-            .nodes
-            .values()
-            .any(|n| n.label == "a.test.ts"));
+        assert!(!indexer.graph.nodes.values().any(|n| n.label == "a.test.ts"));
     }
 
     #[test]
@@ -1297,7 +1279,11 @@ mod tests {
         assert!(!labels.contains(".eslintrc.js"));
         // The config file's import of `./src` must not contribute an edge —
         // the config shouldn't have been parsed at all.
-        assert!(g.edges.is_empty(), "configs must not produce edges: {:?}", g.edges);
+        assert!(
+            g.edges.is_empty(),
+            "configs must not produce edges: {:?}",
+            g.edges
+        );
     }
 
     #[test]
@@ -1321,11 +1307,7 @@ mod tests {
         // `import type { Foo } from './types'` must land on `types.d.ts`
         // when no regular `.ts` exists — TypeScript's resolution order.
         let dir = tempdir().unwrap();
-        fs::write(
-            dir.path().join("types.d.ts"),
-            "export type Foo = number;",
-        )
-        .unwrap();
+        fs::write(dir.path().join("types.d.ts"), "export type Foo = number;").unwrap();
         fs::write(
             dir.path().join("a.ts"),
             r#"import type { Foo } from "./types";"#,
@@ -1347,11 +1329,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("types.ts"), "export const x = 1;").unwrap();
         fs::write(dir.path().join("types.d.ts"), "export const x: number;").unwrap();
-        fs::write(
-            dir.path().join("a.ts"),
-            r#"import { x } from "./types";"#,
-        )
-        .unwrap();
+        fs::write(dir.path().join("a.ts"), r#"import { x } from "./types";"#).unwrap();
 
         let g = index_folder(dir.path()).graph;
         let edge_to_ts = g

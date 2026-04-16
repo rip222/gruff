@@ -79,11 +79,7 @@ impl GruffApp {
                     .show(ui, |ui| {
                         ui.set_min_width(360.0);
                         ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new("Search")
-                                    .color(colors::HINT)
-                                    .small(),
-                            );
+                            ui.label(egui::RichText::new("Search").color(colors::HINT).small());
                             let edit = ui.add(
                                 egui::TextEdit::singleline(&mut input)
                                     .desired_width(f32::INFINITY)
@@ -103,11 +99,7 @@ impl GruffApp {
                             )
                         };
                         ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(status)
-                                    .color(colors::HINT)
-                                    .small(),
-                            );
+                            ui.label(egui::RichText::new(status).color(colors::HINT).small());
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {

@@ -678,7 +678,11 @@ mod tests {
     #[test]
     fn tree_handles_duplicate_positions() {
         // Two bodies at exactly the same point must not infinite-recurse.
-        let positions = vec![Vec2::new(3.0, 7.0), Vec2::new(3.0, 7.0), Vec2::new(3.0, 7.0)];
+        let positions = vec![
+            Vec2::new(3.0, 7.0),
+            Vec2::new(3.0, 7.0),
+            Vec2::new(3.0, 7.0),
+        ];
         let mut layout = layout_with_positions(&positions, 1.0);
         // Should return without stack overflow or hang.
         layout.step(1.0 / 60.0);

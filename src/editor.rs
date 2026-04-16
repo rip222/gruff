@@ -71,10 +71,7 @@ mod tests {
 
     #[test]
     fn unknown_editor_returns_not_found() {
-        let r = open_in_editor(
-            "gruff_nonexistent_editor_xyz_42",
-            &PathBuf::from("/tmp/x"),
-        );
+        let r = open_in_editor("gruff_nonexistent_editor_xyz_42", &PathBuf::from("/tmp/x"));
         assert!(matches!(r, Err(OpenError::NotFound(_))));
     }
 }

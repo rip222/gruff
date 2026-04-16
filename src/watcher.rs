@@ -7,6 +7,7 @@
 //! filesystem-event storm (e.g. `webpack` dumping chunks into `dist/`).
 
 use std::collections::HashMap;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread;
@@ -14,10 +15,11 @@ use std::time::{Duration, Instant};
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{
-    event::{ModifyKind, RemoveKind},
     Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _,
+    event::{ModifyKind, RemoveKind},
 };
 
+use crate::error;
 use crate::indexer::is_source_file;
 
 /// What happened to a file after debouncing. The watcher coalesces multiple
@@ -57,6 +59,8 @@ impl Watcher {
     /// `.gitignore` rules found by walking up from each changed path and
     /// coalesced inside a `debounce` window. Non-source files are dropped.
     pub fn new(root: PathBuf, debounce: Duration) -> Result<Self, notify::Error> {
+        error::install_panic_hook();
+
         let (raw_tx, raw_rx) = mpsc::channel::<Event>();
         let (out_tx, out_rx) = mpsc::channel::<ChangeEvent>();
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
@@ -66,20 +70,23 @@ impl Watcher {
         // up front so downstream filters can strip-prefix reliably.
         let root = root.canonicalize().unwrap_or(root);
         let root_for_watcher = root.clone();
-        let mut watcher = notify::recommended_watcher(
-            move |res: Result<Event, notify::Error>| {
-                if let Ok(event) = res {
-                    // Ignore send errors — means the worker has exited and
-                    // this watcher is about to be dropped anyway.
-                    let _ = raw_tx.send(event);
-                }
-            },
-        )?;
+        let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+            if let Ok(event) = res {
+                // Ignore send errors — means the worker has exited and
+                // this watcher is about to be dropped anyway.
+                let _ = raw_tx.send(event);
+            }
+        })?;
         watcher.watch(&root_for_watcher, RecursiveMode::Recursive)?;
 
-        let worker = thread::spawn(move || {
-            run_worker(raw_rx, out_tx, stop_rx, root, debounce);
-        });
+        let worker = thread::Builder::new()
+            .name("gruff-watcher".to_string())
+            .spawn(move || {
+                let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+                    run_worker(raw_rx, out_tx, stop_rx, root, debounce);
+                }));
+            })
+            .map_err(|err| notify::Error::generic(&err.to_string()))?;
 
         Ok(Self {
             rx: out_rx,
@@ -151,7 +158,9 @@ fn run_worker(
                 .min()
                 .unwrap_or(Duration::ZERO);
             // Sleep just long enough for the oldest event to expire.
-            debounce.saturating_sub(oldest_age).max(Duration::from_millis(5))
+            debounce
+                .saturating_sub(oldest_age)
+                .max(Duration::from_millis(5))
         };
 
         match raw_rx.recv_timeout(timeout) {
@@ -338,11 +347,8 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("a.ts"), "").unwrap();
 
-        let w = Watcher::new(
-            dir.path().to_path_buf(),
-            Duration::from_millis(100),
-        )
-        .expect("watcher");
+        let w =
+            Watcher::new(dir.path().to_path_buf(), Duration::from_millis(100)).expect("watcher");
 
         // Give fsevents a moment to register the watcher before touching.
         sleep(Duration::from_millis(200));
@@ -350,7 +356,9 @@ mod tests {
 
         let events = collect_events(&w, Duration::from_millis(1500));
         assert!(
-            events.iter().any(|e| matches!(e, ChangeEvent::Touched(p) if p.ends_with("a.ts"))),
+            events
+                .iter()
+                .any(|e| matches!(e, ChangeEvent::Touched(p) if p.ends_with("a.ts"))),
             "expected Touched(a.ts) in {events:?}",
         );
     }
@@ -358,11 +366,8 @@ mod tests {
     #[test]
     fn ignores_non_source_extensions() {
         let dir = tempdir().unwrap();
-        let w = Watcher::new(
-            dir.path().to_path_buf(),
-            Duration::from_millis(100),
-        )
-        .expect("watcher");
+        let w =
+            Watcher::new(dir.path().to_path_buf(), Duration::from_millis(100)).expect("watcher");
 
         sleep(Duration::from_millis(200));
         // .md isn't a source file — the watcher should drop the event.
@@ -379,11 +384,8 @@ mod tests {
     fn ignores_node_modules() {
         let dir = tempdir().unwrap();
         fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
-        let w = Watcher::new(
-            dir.path().to_path_buf(),
-            Duration::from_millis(100),
-        )
-        .expect("watcher");
+        let w =
+            Watcher::new(dir.path().to_path_buf(), Duration::from_millis(100)).expect("watcher");
 
         sleep(Duration::from_millis(200));
         fs::write(dir.path().join("node_modules/pkg/index.js"), "").unwrap();
@@ -403,18 +405,17 @@ mod tests {
         fs::write(dir.path().join(".gitignore"), "dist/\n").unwrap();
         fs::create_dir_all(dir.path().join("dist")).unwrap();
 
-        let w = Watcher::new(
-            dir.path().to_path_buf(),
-            Duration::from_millis(100),
-        )
-        .expect("watcher");
+        let w =
+            Watcher::new(dir.path().to_path_buf(), Duration::from_millis(100)).expect("watcher");
 
         sleep(Duration::from_millis(200));
         fs::write(dir.path().join("dist/bundle.js"), "").unwrap();
 
         let events = collect_events(&w, Duration::from_millis(800));
         assert!(
-            !events.iter().any(|e| e.path().to_string_lossy().contains("dist")),
+            !events
+                .iter()
+                .any(|e| e.path().to_string_lossy().contains("dist")),
             "gitignored paths should not fire events, got {events:?}",
         );
     }
@@ -424,18 +425,17 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("a.ts"), "").unwrap();
 
-        let w = Watcher::new(
-            dir.path().to_path_buf(),
-            Duration::from_millis(100),
-        )
-        .expect("watcher");
+        let w =
+            Watcher::new(dir.path().to_path_buf(), Duration::from_millis(100)).expect("watcher");
 
         sleep(Duration::from_millis(200));
         fs::remove_file(dir.path().join("a.ts")).unwrap();
 
         let events = collect_events(&w, Duration::from_millis(1500));
         assert!(
-            events.iter().any(|e| matches!(e, ChangeEvent::Removed(p) if p.ends_with("a.ts"))),
+            events
+                .iter()
+                .any(|e| matches!(e, ChangeEvent::Removed(p) if p.ends_with("a.ts"))),
             "expected Removed(a.ts) in {events:?}",
         );
     }
@@ -454,19 +454,11 @@ mod tests {
         let mut indexer = Indexer::build(dir.path());
         assert_eq!(indexer.graph.edges.len(), 0);
 
-        let w = Watcher::new(
-            indexer.ws.root.clone(),
-            Duration::from_millis(100),
-        )
-        .expect("watcher");
+        let w = Watcher::new(indexer.ws.root.clone(), Duration::from_millis(100)).expect("watcher");
         sleep(Duration::from_millis(200));
 
         // Add an import from a.ts → b.ts on disk.
-        fs::write(
-            dir.path().join("a.ts"),
-            r#"import { b } from "./b";"#,
-        )
-        .unwrap();
+        fs::write(dir.path().join("a.ts"), r#"import { b } from "./b";"#).unwrap();
 
         // Drain events for up to 1.5s and apply them to the indexer. A real
         // UI thread does the same drain-and-apply once per frame.
@@ -497,20 +489,13 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("a.ts"), "").unwrap();
 
-        let w = Watcher::new(
-            dir.path().to_path_buf(),
-            Duration::from_millis(200),
-        )
-        .expect("watcher");
+        let w =
+            Watcher::new(dir.path().to_path_buf(), Duration::from_millis(200)).expect("watcher");
 
         sleep(Duration::from_millis(200));
         // Five quick saves in a row within the debounce window.
         for i in 0..5 {
-            fs::write(
-                dir.path().join("a.ts"),
-                format!("export const x = {i};"),
-            )
-            .unwrap();
+            fs::write(dir.path().join("a.ts"), format!("export const x = {i};")).unwrap();
             sleep(Duration::from_millis(20));
         }
 

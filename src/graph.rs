@@ -166,10 +166,8 @@ impl Graph {
         let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
         let mut has_self_loop: Vec<bool> = vec![false; n];
         for e in &self.edges {
-            let (Some(&u), Some(&v)) = (
-                index_of.get(e.from.as_str()),
-                index_of.get(e.to.as_str()),
-            ) else {
+            let (Some(&u), Some(&v)) = (index_of.get(e.from.as_str()), index_of.get(e.to.as_str()))
+            else {
                 continue;
             };
             adj[u].push(v);
@@ -224,7 +222,9 @@ impl Graph {
                 if lowlinks[v] == indices[v].unwrap() {
                     let mut component: Vec<NodeId> = Vec::new();
                     loop {
-                        let w = stack.pop().expect("tarjan: stack cannot be empty at scc close");
+                        let w = stack
+                            .pop()
+                            .expect("tarjan: stack cannot be empty at scc close");
                         on_stack[w] = false;
                         component.push(ids[w].clone());
                         if w == v {
@@ -370,8 +370,7 @@ mod tests {
 
         let sets = cycle_sets(&g.cycles());
         assert_eq!(sets.len(), 2);
-        let ab: std::collections::BTreeSet<_> =
-            ["a", "b"].iter().map(|s| s.to_string()).collect();
+        let ab: std::collections::BTreeSet<_> = ["a", "b"].iter().map(|s| s.to_string()).collect();
         let cde: std::collections::BTreeSet<_> =
             ["c", "d", "e"].iter().map(|s| s.to_string()).collect();
         assert!(sets.contains(&ab));

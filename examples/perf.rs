@@ -36,7 +36,9 @@ fn main() {
             layout.step(1.0 / 60.0);
         }
         let ms_per_step = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-        println!("n={n:5}  step: {ms_per_step:7.2} ms  => {:.1} fps budget",
-                 1000.0 / ms_per_step);
+        println!(
+            "n={n:5}  step: {ms_per_step:7.2} ms  => {:.1} fps budget",
+            1000.0 / ms_per_step
+        );
     }
 }

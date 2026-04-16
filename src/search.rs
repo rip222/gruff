@@ -65,11 +65,7 @@ pub fn compute_matches(query: &str, nodes: &HashMap<NodeId, Node>) -> HashSet<No
         // matches `apps/web/app.ts` both by basename (`app.ts`) and full
         // path, but a single-char match against something deep in the path
         // still has a shot via the full-id check.
-        let basename = node
-            .path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
+        let basename = node.path.file_name().and_then(|s| s.to_str()).unwrap_or("");
         if fuzzy_match(q, basename) || fuzzy_match(q, id) {
             out.insert(id.clone());
         }
@@ -97,10 +93,7 @@ mod tests {
     }
 
     fn graph(pairs: &[(&str, Option<&str>)]) -> HashMap<NodeId, Node> {
-        pairs
-            .iter()
-            .map(|(id, pkg)| node(id, *pkg))
-            .collect()
+        pairs.iter().map(|(id, pkg)| node(id, *pkg)).collect()
     }
 
     #[test]
@@ -179,9 +172,9 @@ mod tests {
         // A query can match by package for some nodes and by path for others,
         // both contribute to the final match set.
         let g = graph(&[
-            ("libs/core/a.ts", Some("core")),   // pkg match
+            ("libs/core/a.ts", Some("core")),         // pkg match
             ("apps/web/core-config.ts", Some("web")), // basename match
-            ("apps/web/other.ts", Some("web")), // no match
+            ("apps/web/other.ts", Some("web")),       // no match
         ]);
         let m = compute_matches("core", &g);
         assert!(m.contains("libs/core/a.ts"));

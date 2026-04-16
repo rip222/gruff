@@ -21,11 +21,8 @@ impl GruffApp {
         };
         // Snapshot owned copies of the fields we need so `self` stays free for
         // `&mut` calls (editor prompt, frame requests) below.
-        let Some((display_id, display_label, on_disk_path, package, kind)) = self
-            .graph
-            .nodes
-            .get(&selected)
-            .map(|n| {
+        let Some((display_id, display_label, on_disk_path, package, kind)) =
+            self.graph.nodes.get(&selected).map(|n| {
                 (
                     n.id.clone(),
                     n.label.clone(),
@@ -85,10 +82,8 @@ impl GruffApp {
                 ui.horizontal(|ui| {
                     // Small color chip so the sidebar identity matches the
                     // node's color on the canvas at a glance.
-                    let (rect, _) = ui.allocate_exact_size(
-                        egui::vec2(10.0, 10.0),
-                        egui::Sense::hover(),
-                    );
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                     ui.painter().rect_filled(rect, 2.0, swatch);
                     ui.label(egui::RichText::new(name).monospace());
                 });
@@ -100,11 +95,7 @@ impl GruffApp {
 
         ui.add_space(8.0);
         let imports = self.imports.get(&selected).cloned().unwrap_or_default();
-        let imported_by = self
-            .imported_by
-            .get(&selected)
-            .cloned()
-            .unwrap_or_default();
+        let imported_by = self.imported_by.get(&selected).cloned().unwrap_or_default();
 
         render_list(ui, "Imports", &imports);
         ui.add_space(4.0);
@@ -157,10 +148,9 @@ impl GruffApp {
                 for (idx, cycle) in self.cycles.iter().enumerate() {
                     let label = format!("Cycle {}  ·  {} files", idx + 1, cycle.len());
                     // Button is full-width so the whole row is the click target.
-                    let resp = ui.add(egui::Button::new(label).min_size(egui::vec2(
-                        ui.available_width(),
-                        0.0,
-                    )));
+                    let resp = ui.add(
+                        egui::Button::new(label).min_size(egui::vec2(ui.available_width(), 0.0)),
+                    );
                     if resp.clicked() {
                         self.frame_request = Some(idx);
                     }
@@ -171,9 +161,7 @@ impl GruffApp {
                         .default_open(false)
                         .show(ui, |ui| {
                             for node_id in cycle {
-                                ui.label(
-                                    egui::RichText::new(node_id).monospace().small(),
-                                );
+                                ui.label(egui::RichText::new(node_id).monospace().small());
                             }
                         });
                     ui.add_space(2.0);

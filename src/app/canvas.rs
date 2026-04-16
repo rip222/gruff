@@ -36,8 +36,7 @@ impl GruffApp {
         let Some(first) = positions.next() else {
             return;
         };
-        let (mut min_x, mut max_x, mut min_y, mut max_y) =
-            (first.x, first.x, first.y, first.y);
+        let (mut min_x, mut max_x, mut min_y, mut max_y) = (first.x, first.x, first.y, first.y);
         for p in positions {
             min_x = min_x.min(p.x);
             max_x = max_x.max(p.x);
@@ -85,11 +84,7 @@ impl GruffApp {
     }
 
     fn node_render_radius(&self, id: &NodeId, zoom_scale: f32) -> f32 {
-        let deps = self
-            .imported_by
-            .get(id)
-            .map(|v| v.len())
-            .unwrap_or(0) as f32;
+        let deps = self.imported_by.get(id).map(|v| v.len()).unwrap_or(0) as f32;
         // Sqrt keeps the growth gentle; capping the dependents bonus prevents
         // a single megahub (1000+ dependents) from dwarfing every other node
         // into visual noise. The cap is world-units; the full radius is
@@ -257,10 +252,8 @@ impl GruffApp {
             // like a loose thread. `selected` keeps its edges lit so the
             // current selection stays informative under search.
             let search_dim = search_matches.is_some_and(|m| {
-                let from_lit =
-                    m.contains(&edge.from) || self.selected.as_ref() == Some(&edge.from);
-                let to_lit =
-                    m.contains(&edge.to) || self.selected.as_ref() == Some(&edge.to);
+                let from_lit = m.contains(&edge.from) || self.selected.as_ref() == Some(&edge.from);
+                let to_lit = m.contains(&edge.to) || self.selected.as_ref() == Some(&edge.to);
                 !(from_lit && to_lit)
             });
             let (width, color) = if on_path {
@@ -294,8 +287,7 @@ impl GruffApp {
             // Same rule for search: selected stays lit so the user can
             // always see which file they had focused.
             let dim_by_highlight = highlight_active && !on_path && !is_selected;
-            let dim_by_search =
-                search_matches.is_some_and(|m| !m.contains(id) && !is_selected);
+            let dim_by_search = search_matches.is_some_and(|m| !m.contains(id) && !is_selected);
             let color = if dim_by_highlight || dim_by_search {
                 base.gamma_multiply(DIM_ALPHA)
             } else {
@@ -318,14 +310,6 @@ impl GruffApp {
                 egui::Align2::CENTER_CENTER,
                 "Drop a folder or press Cmd+O",
                 egui::FontId::proportional(18.0),
-                colors::HINT,
-            );
-        } else if !self.status.is_empty() {
-            painter.text(
-                egui::pos2(rect.left() + 12.0, rect.bottom() - 14.0),
-                egui::Align2::LEFT_BOTTOM,
-                &self.status,
-                egui::FontId::proportional(12.0),
                 colors::HINT,
             );
         }

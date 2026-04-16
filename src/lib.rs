@@ -2,6 +2,7 @@ pub mod app;
 pub mod colors;
 pub mod config;
 pub mod editor;
+pub mod error;
 pub mod filters;
 pub mod graph;
 pub mod indexer;

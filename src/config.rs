@@ -52,9 +52,7 @@ pub fn config_path() -> Option<PathBuf> {
 }
 
 pub fn load() -> Config {
-    config_path()
-        .map(|p| load_from(&p))
-        .unwrap_or_default()
+    config_path().map(|p| load_from(&p)).unwrap_or_default()
 }
 
 pub fn load_from(path: &Path) -> Config {
@@ -79,8 +77,7 @@ pub fn save_to(path: &Path, cfg: &Config) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let body = toml::to_string_pretty(cfg)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let body = toml::to_string_pretty(cfg).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     fs::write(path, body)
 }
 

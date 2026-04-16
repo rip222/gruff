@@ -89,9 +89,7 @@ pub fn is_config_file(path: &Path) -> bool {
 /// True if `name` starts with `prefix` followed by `.` — so `vite.config` the
 /// prefix matches `vite.config.ts` but not `vite.configs.ts`.
 fn starts_with_segment(name: &str, prefix: &str) -> bool {
-    name.len() > prefix.len()
-        && name.starts_with(prefix)
-        && name.as_bytes()[prefix.len()] == b'.'
+    name.len() > prefix.len() && name.starts_with(prefix) && name.as_bytes()[prefix.len()] == b'.'
 }
 
 #[cfg(test)]
