@@ -1,5 +1,7 @@
 pub mod app;
 pub mod colors;
+pub mod config;
+pub mod editor;
 pub mod graph;
 pub mod indexer;
 pub mod layout;
