@@ -7,6 +7,7 @@ use eframe::egui;
 use crate::colors;
 use crate::config::{self, Config};
 use crate::error::{self, GruffError};
+use crate::export;
 use crate::graph::{Graph, GraphDiff, NodeId};
 use crate::indexer::Indexer;
 use crate::layout::{Layout, Vec2};
@@ -339,6 +340,43 @@ impl GruffApp {
         errors
     }
 
+    /// Write the current graph out as JSON at a user-picked path. Backs the
+    /// "Export graph as JSON…" menu item. Errors from the save dialog (user
+    /// cancelled) are silent; write failures surface in the status bar.
+    fn export_graph_json(&mut self) {
+        let default_name = self
+            .last_root
+            .as_deref()
+            .and_then(|p| p.file_name())
+            .map(|n| format!("{}.graph.json", n.to_string_lossy()))
+            .unwrap_or_else(|| "graph.json".to_string());
+
+        let Some(target) = rfd::FileDialog::new()
+            .add_filter("JSON", &["json"])
+            .set_file_name(&default_name)
+            .save_file()
+        else {
+            return;
+        };
+
+        let exported = export::build_export(&self.graph, &self.cycles, self.last_root.as_deref());
+        match export::write_json(&target, &exported) {
+            Ok(()) => {
+                self.status = format!(
+                    "Exported {} nodes, {} edges, {} cycle{} to {}",
+                    exported.nodes.len(),
+                    exported.edges.len(),
+                    exported.cycles.len(),
+                    if exported.cycles.len() == 1 { "" } else { "s" },
+                    target.display(),
+                );
+            }
+            Err(e) => {
+                self.status = format!("Failed to export: {e}");
+            }
+        }
+    }
+
     /// Drain every debounced watcher event and apply the resulting diffs to
     /// the indexer and the live graph. Returns true if any diff was applied,
     /// so callers can decide to refresh derived indexes / request a repaint.
@@ -504,6 +542,17 @@ impl eframe::App for GruffApp {
                         if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                             self.load_folder(dir);
                         }
+                    }
+                    ui.separator();
+                    // Only enable export when there's an indexed graph — an
+                    // empty export would be misleading rather than useful.
+                    let can_export = !self.graph.nodes.is_empty();
+                    if ui
+                        .add_enabled(can_export, egui::Button::new("Export graph as JSON…"))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.export_graph_json();
                     }
                     ui.separator();
                     if ui.button("Reveal config file").clicked() {
