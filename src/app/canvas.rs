@@ -175,6 +175,21 @@ impl GruffApp {
             self.fit_all(rect, mode);
         }
 
+        // Auto-refit mode: while the physics sim is still visibly moving
+        // after folder load, keep re-fitting the viewport each frame so the
+        // user always sees the whole graph. Once the sim quiesces we stop
+        // requesting new fits (the last fit's target is still in flight and
+        // the tween will land naturally). Any user pan / zoom below will
+        // disable this for the rest of the session.
+        if self.auto_refit {
+            if self.layout.max_velocity() > super::SETTLED_VELOCITY {
+                self.fit_all(rect, FitMode::Snap);
+                ctx.request_repaint();
+            } else {
+                self.auto_refit = false;
+            }
+        }
+
         // Advance any in-flight tween. `is_settled` short-circuits when
         // current == target so this is free on frames with no animation.
         if !self.camera.is_settled() {
@@ -188,6 +203,9 @@ impl GruffApp {
         if response.dragged() {
             let delta = response.drag_delta();
             self.camera.pan_pixels(Vec2::new(delta.x, delta.y));
+            // User took the wheel — stop fighting them with auto-refit for
+            // the rest of the session (or until the next folder open).
+            self.disable_auto_refit_on_user_interaction();
         }
 
         // Click handling: nodes take priority over edges (the hit radius is
@@ -217,6 +235,9 @@ impl GruffApp {
                     Vec2::new(hover.x - center.x, hover.y - center.y),
                     factor,
                 );
+                // Same reasoning as pan: an explicit zoom input means the
+                // user wants their view, not an auto-framed one.
+                self.disable_auto_refit_on_user_interaction();
             }
 
             // Pointer-hand cursor over nodes and edges signals clickability

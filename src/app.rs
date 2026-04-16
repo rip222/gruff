@@ -34,6 +34,25 @@ enum FitMode {
     Tween,
 }
 
+/// Cap on synchronous physics ticks run during `load_folder`'s settle pass.
+/// Paired with [`SETTLE_TIME_BUDGET`] — whichever bound trips first ends the
+/// pass. 500 ticks is enough for small-to-medium graphs to visibly settle;
+/// the time budget keeps huge graphs from stalling the UI.
+const SETTLE_MAX_TICKS: u32 = 500;
+
+/// Wall-clock cap on the settle pass. Matches PRD #16's "~300 ms" target so
+/// the app stays responsive on large folders — once this trips we rely on
+/// auto-refit to keep framing the graph while physics continues in the
+/// normal per-frame loop.
+const SETTLE_TIME_BUDGET: Duration = Duration::from_millis(300);
+
+/// Max per-node speed below which the graph is considered visually at rest.
+/// Used after the load-time settle pass to decide whether to arm auto-refit
+/// and each frame thereafter to decide whether to disarm it. Chosen small
+/// relative to `Layout::max_speed` (≈400) so damping-driven drift doesn't
+/// look "still moving" to the camera.
+const SETTLED_VELOCITY: f32 = 1.0;
+
 pub struct GruffApp {
     graph: Graph,
     /// Mirrors the indexer's `include_tests` option so the menu checkbox has
@@ -69,6 +88,14 @@ pub struct GruffApp {
     /// Current + target viewport transform + tween state. All camera math
     /// lives in the `camera` module; this struct just carries the state.
     camera: Camera,
+    /// When true, the canvas re-runs `Camera::fit` every frame so the
+    /// viewport keeps framing the whole graph while physics continues to
+    /// converge after load. Flipped on at folder load when the settle pass
+    /// didn't fully quiesce the sim, and flipped off the first time the
+    /// user pans or zooms (either ends auto-refit for the rest of the
+    /// session, or until the next folder open). See PRD #16's "Camera
+    /// settle + fit flow at load" for the full state machine.
+    auto_refit: bool,
     sim_enabled: bool,
     status: String,
     /// Count of fully-unresolvable dynamic imports (e.g. `import(modName)`)
@@ -116,6 +143,7 @@ impl Default for GruffApp {
             highlight: None,
             selected: None,
             camera: Camera::new(),
+            auto_refit: false,
             sim_enabled: true,
             status: String::new(),
             unresolved_dynamic: 0,
@@ -180,9 +208,20 @@ impl GruffApp {
         self.layout.sync(&self.graph);
         self.selected = None;
         self.camera = Camera::new();
+        // Run physics synchronously up to ~500 ticks / ~300 ms so the first
+        // fit frames a meaningful bounding box instead of the seed spiral.
+        // On small graphs this finishes well before the budget; on large
+        // ones we exit on the time bound and rely on `auto_refit` to keep
+        // re-framing while physics continues to converge.
+        self.layout.settle(SETTLE_MAX_TICKS, SETTLE_TIME_BUDGET);
         // Fit to the full graph on first frame after load. Snap rather than
         // tween — there's no prior view to animate from.
         self.fit_request = Some(FitMode::Snap);
+        // If the graph is still visibly moving after the settle pass, keep
+        // the camera refitting each frame until the user pans or zooms.
+        // Above the settled threshold we opt in; below it we trust the
+        // snap-fit above and leave auto-refit off.
+        self.auto_refit = self.layout.max_velocity() > SETTLED_VELOCITY;
         self.sim_enabled = true;
 
         // Start (or replace) the filesystem watcher. Drop happens first so
@@ -345,6 +384,15 @@ impl GruffApp {
         for error in error::drain_runtime_errors() {
             self.push_runtime_error(error);
         }
+    }
+
+    /// Called when the user does something that should take the camera out
+    /// of auto-refit (pan, zoom, or any future interaction where they've
+    /// picked their own view). Intentionally a no-op when auto-refit isn't
+    /// active so callers don't need to check. Extracted from the canvas so
+    /// the behavior is unit-testable without an egui context.
+    fn disable_auto_refit_on_user_interaction(&mut self) {
+        self.auto_refit = false;
     }
 
     fn current_status_errors(&self) -> Vec<GruffError> {
@@ -666,5 +714,44 @@ impl eframe::App for GruffApp {
         self.draw_search_overlay(&ctx);
         // Drawn last so the modal paints over the sidebar and canvas.
         self.draw_editor_prompt(&ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_interaction_breaks_auto_refit() {
+        // The core PRD #16 guarantee for this issue: the first pan or zoom
+        // tears down auto-refit for the rest of the session. Drive the
+        // state transition directly so the test doesn't need an egui ctx
+        // or a real folder load.
+        let mut app = GruffApp {
+            auto_refit: true,
+            ..GruffApp::default()
+        };
+        app.disable_auto_refit_on_user_interaction();
+        assert!(!app.auto_refit);
+    }
+
+    #[test]
+    fn disable_auto_refit_is_idempotent() {
+        // Calling the hook while already disabled must be a no-op, so
+        // frames with no interaction don't flip state spuriously.
+        let mut app = GruffApp {
+            auto_refit: false,
+            ..GruffApp::default()
+        };
+        app.disable_auto_refit_on_user_interaction();
+        assert!(!app.auto_refit);
+    }
+
+    #[test]
+    fn fresh_app_has_auto_refit_off() {
+        // Default state is "not auto-refitting" — load_folder is the only
+        // place that arms it, based on post-settle velocity.
+        let app = GruffApp::default();
+        assert!(!app.auto_refit);
     }
 }

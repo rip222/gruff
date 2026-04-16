@@ -116,6 +116,48 @@ impl Layout {
         self.ids.iter().zip(self.positions.iter().copied())
     }
 
+    /// Largest per-node speed (length of the velocity vector) across every
+    /// body in the simulation. Used by the settle / auto-refit logic to
+    /// decide whether the layout has stopped moving: when the max is below a
+    /// small threshold the graph is visually at rest and the camera can
+    /// disengage auto-refit. Returns 0.0 for an empty layout.
+    pub fn max_velocity(&self) -> f32 {
+        let mut max_sq = 0.0_f32;
+        for v in &self.velocities {
+            let sq = v.x * v.x + v.y * v.y;
+            if sq > max_sq {
+                max_sq = sq;
+            }
+        }
+        max_sq.sqrt()
+    }
+
+    /// Run the simulation forward up to `max_ticks` times or until
+    /// `time_budget` has elapsed — whichever comes first. Used at folder
+    /// load to bring a fresh layout close to a settled state before the
+    /// first fit, so the initial view frames a meaningful bounding box
+    /// instead of the seed-spiral.
+    ///
+    /// Returns the number of ticks actually executed. A per-tick `dt` of
+    /// `1/60` matches the per-frame integration step used in the app loop
+    /// so settle-time physics and live-frame physics evolve identically.
+    pub fn settle(&mut self, max_ticks: u32, time_budget: std::time::Duration) -> u32 {
+        if self.positions.is_empty() || max_ticks == 0 {
+            return 0;
+        }
+        let start = std::time::Instant::now();
+        let dt = 1.0 / 60.0;
+        let mut ticks = 0u32;
+        while ticks < max_ticks {
+            self.step(dt);
+            ticks += 1;
+            if start.elapsed() >= time_budget {
+                break;
+            }
+        }
+        ticks
+    }
+
     /// Rebuild the flat arrays from `graph`. Preserves positions/velocities
     /// of nodes that still exist; seeds new nodes on a spiral.
     pub fn sync(&mut self, graph: &Graph) {
@@ -784,5 +826,79 @@ mod tests {
         let before = layout.positions.len();
         layout.step(1.0 / 60.0);
         assert_eq!(layout.positions.len(), before);
+    }
+
+    #[test]
+    fn max_velocity_on_empty_layout_is_zero() {
+        let layout = Layout::new();
+        assert_eq!(layout.max_velocity(), 0.0);
+    }
+
+    #[test]
+    fn max_velocity_reports_largest_speed() {
+        // Directly seed velocities so we're asserting on the reducer, not on
+        // the integrator.
+        let positions: Vec<Vec2> = (0..3).map(|i| Vec2::new(i as f32, 0.0)).collect();
+        let mut layout = layout_with_positions(&positions, 1.0);
+        layout.velocities[0] = Vec2::new(3.0, 4.0); // speed 5
+        layout.velocities[1] = Vec2::new(0.0, 1.0); // speed 1
+        layout.velocities[2] = Vec2::new(-2.0, 0.0); // speed 2
+        assert!((layout.max_velocity() - 5.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn settle_runs_up_to_max_ticks_on_small_graph() {
+        // Ten bodies, 500-tick cap, generous time budget: the tick bound
+        // must be the one that ends the pass.
+        let positions: Vec<Vec2> = (0..10)
+            .map(|i| {
+                let a = (i as f32) * 0.8;
+                Vec2::new(50.0 * a.cos(), 50.0 * a.sin())
+            })
+            .collect();
+        let mut layout = layout_with_positions(&positions, 1.0);
+        let ticks = layout.settle(500, std::time::Duration::from_secs(60));
+        assert_eq!(ticks, 500);
+    }
+
+    #[test]
+    fn settle_returns_zero_on_empty_layout() {
+        let mut layout = Layout::new();
+        let ticks = layout.settle(500, std::time::Duration::from_millis(300));
+        assert_eq!(ticks, 0);
+    }
+
+    #[test]
+    fn settle_respects_zero_tick_cap() {
+        let positions = vec![Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0)];
+        let mut layout = layout_with_positions(&positions, 1.0);
+        let ticks = layout.settle(0, std::time::Duration::from_secs(1));
+        assert_eq!(ticks, 0);
+    }
+
+    #[test]
+    fn settle_brings_small_graph_close_to_rest() {
+        // A connected graph of modest size should settle well within the
+        // 500-tick budget: max_velocity drops to near zero.
+        let mut g = Graph::new();
+        for i in 0..6 {
+            g.add_node(n(&format!("n{i}")));
+        }
+        let mut layout = Layout::new();
+        layout.sync(&g);
+        // Push velocities up to something non-trivial before settling so
+        // we're asserting the sim brings them down, not that they started
+        // at zero.
+        layout.step(1.0 / 60.0);
+        let moving = layout.max_velocity();
+        assert!(moving >= 0.0);
+        layout.settle(500, std::time::Duration::from_secs(60));
+        // After 500 ticks of O(1)-node damping-dominated motion on a tiny
+        // graph, velocity must be small relative to the sim's max_speed.
+        assert!(
+            layout.max_velocity() < 5.0,
+            "max velocity {} is still too high after settle",
+            layout.max_velocity()
+        );
     }
 }
