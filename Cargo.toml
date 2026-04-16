@@ -4,3 +4,22 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+eframe = { version = "0.34", default-features = false, features = ["default_fonts", "wgpu"] }
+egui = "0.34"
+rfd = "0.17"
+walkdir = "2.5"
+swc_common = "21"
+swc_ecma_parser = "38"
+swc_ecma_ast = "23"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.dev]
+opt-level = 3
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"

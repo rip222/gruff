@@ -1,0 +1,112 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use walkdir::WalkDir;
+
+use crate::graph::{Graph, Node};
+use crate::parser::parse_file_imports;
+use crate::resolver::resolve_relative;
+
+const SOURCE_EXTS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs"];
+
+/// Walk `root`, parse every JS/TS file, resolve each relative import, and build
+/// a file-level dependency graph. Skips `node_modules` and hidden directories.
+pub fn index_folder(root: &Path) -> Graph {
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut graph = Graph::new();
+
+    let mut files: Vec<PathBuf> = Vec::new();
+    for entry in WalkDir::new(&canonical_root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || !is_ignored(e.path()))
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        if !SOURCE_EXTS.contains(&ext) {
+            continue;
+        }
+        files.push(path.to_path_buf());
+    }
+
+    let mut id_by_path: HashMap<PathBuf, String> = HashMap::new();
+    for f in &files {
+        let canonical = f.canonicalize().unwrap_or_else(|_| f.clone());
+        let rel = canonical
+            .strip_prefix(&canonical_root)
+            .unwrap_or(&canonical)
+            .to_path_buf();
+        let id = rel.to_string_lossy().replace('\\', "/");
+        let label = canonical
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| id.clone());
+        graph.add_node(Node {
+            id: id.clone(),
+            path: canonical.clone(),
+            label,
+        });
+        id_by_path.insert(canonical, id);
+    }
+
+    for f in &files {
+        let from_canonical = f.canonicalize().unwrap_or_else(|_| f.clone());
+        let Some(from_id) = id_by_path.get(&from_canonical).cloned() else {
+            continue;
+        };
+        for imp in parse_file_imports(&from_canonical) {
+            let Some(resolved) = resolve_relative(&from_canonical, &imp.source) else {
+                continue;
+            };
+            let resolved_canonical = resolved.canonicalize().unwrap_or(resolved);
+            if let Some(to_id) = id_by_path.get(&resolved_canonical) {
+                graph.add_edge(&from_id, to_id);
+            }
+        }
+    }
+
+    graph
+}
+
+fn is_ignored(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    // Skip node_modules and any hidden directory (e.g. `.git`, `.next`, `.turbo`).
+    name == "node_modules" || (name.starts_with('.') && name != "." && name != "..")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn indexes_two_files_with_one_import() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.ts"), r#"import { b } from "./b";"#).unwrap();
+        fs::write(dir.path().join("b.ts"), "export const b = 1;").unwrap();
+
+        let g = index_folder(dir.path());
+        assert_eq!(g.nodes.len(), 2);
+        assert_eq!(g.edges.len(), 1);
+    }
+
+    #[test]
+    fn skips_node_modules() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.ts"), "").unwrap();
+        fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+        fs::write(dir.path().join("node_modules/pkg/index.js"), "").unwrap();
+
+        let g = index_folder(dir.path());
+        assert_eq!(g.nodes.len(), 1);
+    }
+}
