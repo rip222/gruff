@@ -993,7 +993,6 @@ dependencies = [
  "swc_ecma_visit",
  "tempfile",
  "toml",
- "walkdir",
 ]
 
 [[package]]

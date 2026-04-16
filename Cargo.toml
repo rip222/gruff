@@ -7,7 +7,6 @@ edition = "2024"
 eframe = { version = "0.34", default-features = false, features = ["default_fonts", "wgpu"] }
 egui = "0.34"
 rfd = "0.17"
-walkdir = "2.5"
 swc_common = "21"
 swc_ecma_parser = "38"
 swc_ecma_ast = "23"

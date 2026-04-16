@@ -2,7 +2,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,8 +25,9 @@ pub struct Package {
 }
 
 /// Monorepo handle produced by [`Workspace::discover`]. Holds every discovered
-/// package, the per-package `tsconfig.json` locations the resolver will need
-/// (slice #6), and a `.gitignore`-aware path matcher (slice #11).
+/// package and the per-package `tsconfig.json` locations the resolver needs.
+/// Path filtering (gitignore, hidden files, `node_modules`) is handled by the
+/// indexer's `ignore::WalkBuilder` rather than being plumbed through here.
 pub struct Workspace {
     pub root: PathBuf,
     pub package_manager: PackageManager,
@@ -36,13 +36,12 @@ pub struct Workspace {
     pub workspace_globs: Vec<String>,
     pub packages: Vec<Package>,
     pub tsconfigs: Vec<PathBuf>,
-    gitignore: Gitignore,
 }
 
 impl Workspace {
     /// Scan `root` for monorepo structure: detect the package manager from the
-    /// lockfile, expand `workspaces` globs, locate nested `package.json` and
-    /// `tsconfig.json` files, and build a `.gitignore`-aware matcher.
+    /// lockfile, expand `workspaces` globs, and locate nested `package.json`
+    /// and `tsconfig.json` files.
     ///
     /// Works identically for a single-package repo: the returned `Workspace`
     /// has one [`Package`] and an empty `workspace_globs`.
@@ -99,58 +98,13 @@ impl Workspace {
             }
         }
 
-        let gitignore = build_gitignore(&root);
-
         Self {
             root,
             package_manager,
             workspace_globs,
             packages,
             tsconfigs,
-            gitignore,
         }
-    }
-
-    /// True if `path` is excluded by `.gitignore` at the workspace root, or
-    /// sits inside a universally-ignored directory (`node_modules`, `.git`,
-    /// etc.). Works for both files and directories.
-    ///
-    /// The "always ignored" check operates on the path **relative to the
-    /// workspace root** — ancestor directories above the root (e.g. a temp
-    /// dir whose name starts with `.`) must not trigger false positives.
-    pub fn is_ignored(&self, path: &Path) -> bool {
-        if self.is_always_ignored(path) {
-            return true;
-        }
-        // The `ignore` crate panics if the path isn't under the gitignore
-        // root, so canonicalize and reject outsiders explicitly.
-        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        if !canon.starts_with(&self.root) {
-            return false;
-        }
-        let is_dir = canon.is_dir();
-        // `matched_path_or_any_parents` lets `dist/` catch `dist/bundle.js` —
-        // otherwise only the directory itself would be ignored, not its files.
-        self.gitignore
-            .matched_path_or_any_parents(&canon, is_dir)
-            .is_ignore()
-    }
-
-    fn is_always_ignored(&self, path: &Path) -> bool {
-        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let rel: &Path = canon.strip_prefix(&self.root).unwrap_or(&canon);
-        for comp in rel.components() {
-            let Some(name) = comp.as_os_str().to_str() else {
-                continue;
-            };
-            if name == "node_modules" {
-                return true;
-            }
-            if name.starts_with('.') && name != "." && name != ".." {
-                return true;
-            }
-        }
-        false
     }
 
     /// The package that owns `file`, chosen by deepest matching root. Returns
@@ -370,17 +324,6 @@ fn read_package(dir: &Path) -> Option<Package> {
     Some(Package { name, root, manifest })
 }
 
-// --- gitignore matcher ------------------------------------------------------
-
-fn build_gitignore(root: &Path) -> Gitignore {
-    let mut builder = GitignoreBuilder::new(root);
-    let gitignore = root.join(".gitignore");
-    if gitignore.is_file() {
-        let _ = builder.add(&gitignore);
-    }
-    builder.build().unwrap_or_else(|_| Gitignore::empty())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,34 +489,4 @@ mod tests {
         assert!(near.to_string_lossy().contains("packages/a"));
     }
 
-    #[test]
-    fn gitignore_matcher_ignores_listed_paths() {
-        let dir = tempdir().unwrap();
-        write(dir.path(), "package.json", r#"{"name":"root"}"#);
-        write(dir.path(), ".gitignore", "dist/\n*.log\n");
-        let dist = write(dir.path(), "dist/bundle.js", "");
-        let log = write(dir.path(), "server.log", "");
-        let src = write(dir.path(), "src/index.ts", "");
-
-        let ws = Workspace::discover(dir.path());
-        assert!(ws.is_ignored(&dist));
-        assert!(ws.is_ignored(&log));
-        assert!(!ws.is_ignored(&src));
-    }
-
-    #[test]
-    fn always_ignores_node_modules_and_dotdirs() {
-        // Even without a .gitignore file, these paths must be excluded — they
-        // represent universal noise (install output, VCS metadata).
-        let dir = tempdir().unwrap();
-        write(dir.path(), "package.json", r#"{"name":"root"}"#);
-        let nm = write(dir.path(), "node_modules/pkg/index.js", "");
-        let git = write(dir.path(), ".git/HEAD", "");
-        let ok = write(dir.path(), "src/a.ts", "");
-
-        let ws = Workspace::discover(dir.path());
-        assert!(ws.is_ignored(&nm));
-        assert!(ws.is_ignored(&git));
-        assert!(!ws.is_ignored(&ok));
-    }
 }

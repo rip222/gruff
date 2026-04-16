@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use walkdir::WalkDir;
+use ignore::WalkBuilder;
 
 use crate::graph::{Graph, Node, NodeKind};
 use crate::parser::{parse_file_imports, ImportKind};
@@ -50,20 +50,26 @@ pub fn index_folder(root: &Path) -> IndexResult {
 
 /// Walk the workspace, parse every JS/TS file, resolve every import (static,
 /// require, dynamic, re-export), and build a file-level dependency graph with
-/// each node tagged by its owning package. Respects the workspace's
-/// `.gitignore`-aware matcher.
+/// each node tagged by its owning package. Uses `ignore::WalkBuilder`, which
+/// natively respects nested `.gitignore` files, `.ignore`, `.git/info/exclude`,
+/// and hidden-file rules — all the way down the tree, not just at the root.
 pub fn index_workspace(ws: &Workspace) -> IndexResult {
     let mut graph = Graph::new();
     let ctx = ResolverContext::build(ws);
     let mut unresolved_dynamic: usize = 0;
 
     let mut files: Vec<PathBuf> = Vec::new();
-    for entry in WalkDir::new(&ws.root)
+    let walker = WalkBuilder::new(&ws.root)
         .follow_links(false)
-        .into_iter()
-        .filter_entry(|e| e.depth() == 0 || !ws.is_ignored(e.path()))
-        .filter_map(Result::ok)
-    {
+        // `WalkBuilder` only honors `.gitignore` inside an actual git repo by
+        // default; `require_git(false)` makes the rules apply universally,
+        // which matches what a user dropping any folder into Gruff expects.
+        .require_git(false)
+        // `node_modules` is universal noise and isn't always gitignored in
+        // every nested package, so we drop it explicitly.
+        .filter_entry(|e| e.file_name() != "node_modules")
+        .build();
+    for entry in walker.filter_map(Result::ok) {
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -236,6 +242,59 @@ mod tests {
         fs::write(dir.path().join("a.ts"), "").unwrap();
         fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
         fs::write(dir.path().join("node_modules/pkg/index.js"), "").unwrap();
+
+        let g = index_folder(dir.path()).graph;
+        assert_eq!(g.nodes.len(), 1);
+    }
+
+    #[test]
+    fn skips_paths_ignored_by_root_gitignore() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(".gitignore"), "dist/\n").unwrap();
+        fs::write(dir.path().join("src.ts"), "").unwrap();
+        fs::create_dir_all(dir.path().join("dist")).unwrap();
+        fs::write(dir.path().join("dist/bundle.js"), "").unwrap();
+
+        let g = index_folder(dir.path()).graph;
+        assert_eq!(g.nodes.len(), 1);
+        assert!(g.nodes.values().any(|n| n.label == "src.ts"));
+    }
+
+    #[test]
+    fn skips_paths_ignored_by_nested_gitignore() {
+        // Regression: the root matcher used to be the only one consulted, so
+        // rules living in a nested `.gitignore` (e.g. a Capacitor-style mobile
+        // project that ignores its built public/ bundle) were silently lost
+        // and the minified chunks showed up as graph nodes.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("root.ts"), "").unwrap();
+        fs::create_dir_all(dir.path().join("mobile/ios/App/App/public")).unwrap();
+        fs::write(dir.path().join("mobile/ios/.gitignore"), "App/App/public\n").unwrap();
+        fs::write(
+            dir.path().join("mobile/ios/App/App/public/chunk-AAA.js"),
+            "",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("mobile/ios/App/App/public/chunk-BBB.js"),
+            "",
+        )
+        .unwrap();
+
+        let g = index_folder(dir.path()).graph;
+        assert!(
+            g.nodes.values().all(|n| !n.label.starts_with("chunk-")),
+            "nested gitignore should have hidden the chunks, got nodes: {:?}",
+            g.nodes.values().map(|n| &n.label).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn skips_dot_directories() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.ts"), "").unwrap();
+        fs::create_dir_all(dir.path().join(".cache")).unwrap();
+        fs::write(dir.path().join(".cache/leaked.ts"), "").unwrap();
 
         let g = index_folder(dir.path()).graph;
         assert_eq!(g.nodes.len(), 1);
