@@ -23,6 +23,10 @@ use search::SearchState;
 
 pub struct GruffApp {
     graph: Graph,
+    /// Mirrors the indexer's `include_tests` option so the menu checkbox has
+    /// somewhere to bind without reaching into `self.indexer` through a
+    /// closure. Kept in sync by [`GruffApp::set_include_tests`].
+    include_tests: bool,
     layout: Layout,
     imports: HashMap<NodeId, Vec<NodeId>>,
     imported_by: HashMap<NodeId, Vec<NodeId>>,
@@ -79,6 +83,7 @@ impl Default for GruffApp {
     fn default() -> Self {
         Self {
             graph: Graph::new(),
+            include_tests: false,
             layout: Layout::new(),
             imports: HashMap::new(),
             imported_by: HashMap::new(),
@@ -106,7 +111,12 @@ impl Default for GruffApp {
 impl GruffApp {
     fn load_folder(&mut self, path: PathBuf) {
         let start = Instant::now();
-        let indexer = Indexer::build(&path);
+        let mut indexer = Indexer::build(&path);
+        // Carry the toggle across folder changes so the user doesn't have to
+        // re-enable "include test files" every time they open a new repo.
+        if indexer.options.include_tests != self.include_tests {
+            indexer.set_include_tests(self.include_tests);
+        }
         self.graph = indexer.graph.clone();
         self.unresolved_dynamic = indexer.unresolved_dynamic;
         self.last_root = Some(indexer.ws.root.clone());
@@ -143,6 +153,37 @@ impl GruffApp {
             }
         }
 
+        self.set_status_after_index(start.elapsed());
+    }
+
+    /// Flip the "include test files" toggle. Rescans the current folder so
+    /// the test nodes (re)appear or disappear immediately — same end state
+    /// as pressing Cmd+R after editing the config.
+    fn set_include_tests(&mut self, include: bool) {
+        if self.include_tests == include {
+            return;
+        }
+        self.include_tests = include;
+        let Some(indexer) = self.indexer.as_mut() else {
+            // No folder loaded yet — nothing to re-index. The preference
+            // still persists so the next `load_folder` picks it up.
+            return;
+        };
+        let start = Instant::now();
+        indexer.set_include_tests(include);
+        self.graph = indexer.graph.clone();
+        self.unresolved_dynamic = indexer.unresolved_dynamic;
+        self.rebuild_derived_indexes();
+        self.layout.sync(&self.graph);
+        self.frame_request = None;
+        self.highlight = None;
+        // A node that was just filtered out of the graph can't stay
+        // selected — clear rather than render a dangling sidebar.
+        if let Some(selected) = self.selected.clone() {
+            if !self.graph.nodes.contains_key(&selected) {
+                self.selected = None;
+            }
+        }
         self.set_status_after_index(start.elapsed());
     }
 
@@ -396,6 +437,18 @@ impl eframe::App for GruffApp {
                     if ui.button("Reveal config file").clicked() {
                         ui.close();
                         self.reveal_config_file();
+                    }
+                });
+                ui.menu_button("View", |ui| {
+                    // Checkbox-style menu item so the current state is
+                    // always visible at a glance; flipping it triggers an
+                    // immediate rescan via `set_include_tests`.
+                    let mut include_tests = self.include_tests;
+                    if ui
+                        .checkbox(&mut include_tests, "Include test files")
+                        .changed()
+                    {
+                        self.set_include_tests(include_tests);
                     }
                 });
             });

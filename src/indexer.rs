@@ -3,12 +3,23 @@ use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
 
+use crate::filters::{is_config_file, is_test_file};
 use crate::graph::{Edge, Graph, GraphDiff, Node, NodeId, NodeKind};
 use crate::parser::{parse_file_imports, ImportKind};
 use crate::resolver::{resolve_import, ResolvedImport, ResolverContext};
 use crate::workspace::Workspace;
 
 const SOURCE_EXTS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs"];
+
+/// Indexer knobs the UI can flip at runtime. Kept small — new filters belong
+/// here so the "what does the default graph show?" answer stays in one place.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IndexerOptions {
+    /// When false (default), test files (`*.test.*`, `*.spec.*`) are dropped
+    /// from the graph. Toggle the menu item or call
+    /// [`Indexer::set_include_tests`] to flip.
+    pub include_tests: bool,
+}
 
 /// Node id prefix for synthetic external-package leaves. Picked so it can't
 /// collide with a relative-path file id (paths have no `:` in them).
@@ -60,6 +71,7 @@ pub struct Indexer {
     pub ctx: ResolverContext,
     pub graph: Graph,
     pub unresolved_dynamic: usize,
+    pub options: IndexerOptions,
     /// `canonical_path → graph node id`. Populated for every file node; used
     /// by `update_file` to locate the existing node without rescanning.
     id_by_path: HashMap<PathBuf, NodeId>,
@@ -113,6 +125,23 @@ pub fn index_folder(root: &Path) -> IndexResult {
     }
 }
 
+/// True if `path` passes the indexer's active file gate: JS/TS source file,
+/// not a known build config, and — when `include_tests` is off — not a test
+/// file. Surfaced so the watcher can mirror the same filter when deciding
+/// whether to forward an event.
+pub fn passes_filters(path: &Path, options: IndexerOptions) -> bool {
+    if !is_source_file(path) {
+        return false;
+    }
+    if is_config_file(path) {
+        return false;
+    }
+    if !options.include_tests && is_test_file(path) {
+        return false;
+    }
+    true
+}
+
 impl Indexer {
     /// Full scan from a repo root. Equivalent to `index_folder` plus keeping
     /// the state alive for subsequent [`Indexer::update_file`] calls.
@@ -130,6 +159,7 @@ impl Indexer {
             ctx,
             graph: Graph::new(),
             unresolved_dynamic: 0,
+            options: IndexerOptions::default(),
             id_by_path: HashMap::new(),
             package_of_file: HashMap::new(),
             imports_by_file: HashMap::new(),
@@ -160,8 +190,20 @@ impl Indexer {
         self.full_scan();
     }
 
+    /// Flip the "include test files" toggle and rebuild the graph. The test-
+    /// set changing is a structural edit — a full rescan is simpler and fast
+    /// enough that we don't bother with a surgical "add/remove just the test
+    /// files" path.
+    pub fn set_include_tests(&mut self, include: bool) {
+        if self.options.include_tests == include {
+            return;
+        }
+        self.options.include_tests = include;
+        self.rescan();
+    }
+
     fn full_scan(&mut self) {
-        let files = collect_source_files(&self.ws.root);
+        let files = collect_source_files(&self.ws.root, self.options);
 
         for f in &files {
             let canonical = canonicalize_or(f);
@@ -197,6 +239,13 @@ impl Indexer {
     /// [`Graph::apply`] on `indexer.graph` plus the live view).
     pub fn update_file(&mut self, path: &Path) -> GraphDiff {
         if !is_source_file(path) || !path.is_file() {
+            return GraphDiff::default();
+        }
+        // Honor the same gating the initial scan applies — without this, a
+        // new test file would sneak in as a live update even though the
+        // toggle is off, and a config file dropped in during editing would
+        // get parsed for imports.
+        if !passes_filters(path, self.options) {
             return GraphDiff::default();
         }
         let canonical = canonicalize_or(path);
@@ -554,7 +603,7 @@ fn relative_id(root: &Path, canonical: &Path) -> NodeId {
     rel.to_string_lossy().replace('\\', "/")
 }
 
-fn collect_source_files(root: &Path) -> Vec<PathBuf> {
+fn collect_source_files(root: &Path, options: IndexerOptions) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let walker = WalkBuilder::new(root)
         .follow_links(false)
@@ -568,7 +617,7 @@ fn collect_source_files(root: &Path) -> Vec<PathBuf> {
         .build();
     for entry in walker.filter_map(Result::ok) {
         let path = entry.path();
-        if path.is_file() && is_source_file(path) {
+        if path.is_file() && passes_filters(path, options) {
             files.push(path.to_path_buf());
         }
     }
@@ -1161,5 +1210,154 @@ mod tests {
             .values()
             .any(|n| matches!(n.kind, NodeKind::External));
         assert!(!has_external, "external react leaf should be dropped");
+    }
+
+    // --- filter gate: tests, configs, declaration files ------------------
+
+    #[test]
+    fn test_files_excluded_by_default() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("foo.ts"), "").unwrap();
+        fs::write(dir.path().join("foo.test.ts"), "").unwrap();
+        fs::write(dir.path().join("bar.spec.tsx"), "").unwrap();
+
+        let g = index_folder(dir.path()).graph;
+        let labels: std::collections::HashSet<_> =
+            g.nodes.values().map(|n| n.label.clone()).collect();
+        assert!(labels.contains("foo.ts"));
+        assert!(!labels.contains("foo.test.ts"));
+        assert!(!labels.contains("bar.spec.tsx"));
+    }
+
+    #[test]
+    fn toggle_include_tests_brings_test_files_back() {
+        // Flipping the toggle should make test files reappear without the
+        // caller needing to rebuild the indexer — a rescan inside the
+        // setter does the work.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.ts"), "").unwrap();
+        fs::write(
+            dir.path().join("a.test.ts"),
+            r#"import { a } from "./a";"#,
+        )
+        .unwrap();
+
+        let mut indexer = Indexer::build(dir.path());
+        assert!(!indexer
+            .graph
+            .nodes
+            .values()
+            .any(|n| n.label == "a.test.ts"));
+
+        indexer.set_include_tests(true);
+        assert!(indexer
+            .graph
+            .nodes
+            .values()
+            .any(|n| n.label == "a.test.ts"));
+        // The edge from the test file into the production file should also
+        // appear, because the rescan reparsed it.
+        assert!(indexer
+            .graph
+            .edges
+            .iter()
+            .any(|e| e.from.ends_with("a.test.ts") && e.to.ends_with("a.ts")));
+
+        // Toggling off again removes them.
+        indexer.set_include_tests(false);
+        assert!(!indexer
+            .graph
+            .nodes
+            .values()
+            .any(|n| n.label == "a.test.ts"));
+    }
+
+    #[test]
+    fn config_files_are_skipped() {
+        // Common config names should never become nodes — even if they have
+        // valid JS/TS extensions and happen to import other workspace files.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("src.ts"), "").unwrap();
+        fs::write(
+            dir.path().join("vite.config.ts"),
+            r#"import { x } from "./src";"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("jest.config.js"), "module.exports = {};").unwrap();
+        fs::write(dir.path().join("babel.config.cjs"), "module.exports = {};").unwrap();
+        fs::write(dir.path().join(".eslintrc.js"), "module.exports = {};").unwrap();
+
+        let g = index_folder(dir.path()).graph;
+        let labels: std::collections::HashSet<_> =
+            g.nodes.values().map(|n| n.label.clone()).collect();
+        assert!(labels.contains("src.ts"));
+        assert!(!labels.contains("vite.config.ts"));
+        assert!(!labels.contains("jest.config.js"));
+        assert!(!labels.contains("babel.config.cjs"));
+        assert!(!labels.contains(".eslintrc.js"));
+        // The config file's import of `./src` must not contribute an edge —
+        // the config shouldn't have been parsed at all.
+        assert!(g.edges.is_empty(), "configs must not produce edges: {:?}", g.edges);
+    }
+
+    #[test]
+    fn declaration_files_appear_as_nodes() {
+        // `.d.ts` files are type-only but still meaningful nodes so users
+        // can see what's using them.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("types.d.ts"), "export type X = number;").unwrap();
+        fs::write(dir.path().join("a.ts"), "").unwrap();
+
+        let g = index_folder(dir.path()).graph;
+        assert!(
+            g.nodes.values().any(|n| n.label == "types.d.ts"),
+            "expected types.d.ts node, got {:?}",
+            g.nodes.values().map(|n| &n.label).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn type_only_import_resolves_to_declaration_file() {
+        // `import type { Foo } from './types'` must land on `types.d.ts`
+        // when no regular `.ts` exists — TypeScript's resolution order.
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("types.d.ts"),
+            "export type Foo = number;",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("a.ts"),
+            r#"import type { Foo } from "./types";"#,
+        )
+        .unwrap();
+
+        let g = index_folder(dir.path()).graph;
+        let has_type_edge = g
+            .edges
+            .iter()
+            .any(|e| e.from.ends_with("a.ts") && e.to.ends_with("types.d.ts"));
+        assert!(has_type_edge, "missing type-only edge in {:?}", g.edges);
+    }
+
+    #[test]
+    fn declaration_file_preferred_only_when_no_ts_alternative() {
+        // When both `types.ts` and `types.d.ts` exist, the regular `.ts`
+        // wins — mirrors TypeScript's own priority.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("types.ts"), "export const x = 1;").unwrap();
+        fs::write(dir.path().join("types.d.ts"), "export const x: number;").unwrap();
+        fs::write(
+            dir.path().join("a.ts"),
+            r#"import { x } from "./types";"#,
+        )
+        .unwrap();
+
+        let g = index_folder(dir.path()).graph;
+        let edge_to_ts = g
+            .edges
+            .iter()
+            .any(|e| e.from.ends_with("a.ts") && e.to == "types.ts");
+        assert!(edge_to_ts, "expected edge to types.ts, got {:?}", g.edges);
     }
 }

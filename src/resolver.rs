@@ -8,8 +8,12 @@ use serde_json::Value;
 use crate::parser::{ImportKind, ImportStatement};
 use crate::workspace::Workspace;
 
-/// Extensions probed when resolving a relative import that has no extension on disk.
-pub const CANDIDATE_EXTS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs"];
+/// Extensions probed when resolving a relative import that has no extension
+/// on disk. Order matches TypeScript's own resolution priority so an
+/// ambiguous `./foo` lands on the same file TypeScript would pick: the
+/// concrete `.ts`/`.tsx` win over the `.d.ts` declaration, which in turn wins
+/// over `.js`/`.jsx`.
+pub const CANDIDATE_EXTS: &[&str] = &["ts", "tsx", "d.ts", "js", "jsx", "mjs", "cjs"];
 
 /// Outcome of resolving an import specifier.
 ///
