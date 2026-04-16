@@ -14,6 +14,10 @@ pub const SELECTED_RING: Color32 = Color32::from_rgb(0xFF, 0xE1, 0x8A);
 /// slice #4. Kept muted so external leaves don't compete with workspace files
 /// for visual attention.
 pub const EXTERNAL_NODE: Color32 = Color32::from_rgb(0x78, 0x80, 0x8C);
+/// Edges and nodes on the currently-highlighted dependency path. Bright cyan
+/// sits well clear of cycle-red and selection-yellow so a highlighted path
+/// that passes through cycles or the selected node remains readable.
+pub const PATH_EDGE: Color32 = Color32::from_rgb(0x4C, 0xC9, 0xF0);
 
 /// Deterministic distinct color for a package at position `index` in the
 /// discovery order. Uses golden-ratio hue rotation so any number of packages

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -7,7 +7,7 @@ use eframe::egui;
 use crate::colors;
 use crate::config::{self, Config};
 use crate::editor::{self, OpenError};
-use crate::graph::{Graph, NodeId, NodeKind};
+use crate::graph::{Edge, Graph, NodeId, NodeKind};
 use crate::indexer::index_folder;
 use crate::layout::{Layout, Vec2};
 
@@ -22,6 +22,20 @@ const QUICK_PICK_EDITORS: &[&str] = &["code", "cursor", "subl", "idea", "nvim", 
 enum PendingEditorAction {
     OpenFile(PathBuf),
     RevealConfig,
+}
+
+/// Snapshot of the dependency chain a user clicked into — the clicked edge
+/// plus every edge that lies on some path passing through it. Lets the
+/// renderer highlight/dim in O(1) per edge instead of recomputing chains
+/// every frame.
+#[derive(Debug, Clone, Default)]
+struct PathHighlight {
+    /// `(from, to)` pairs for every edge on the chain, including the clicked
+    /// edge itself. Used by the edge render loop to decide highlight vs dim.
+    edges: HashSet<(NodeId, NodeId)>,
+    /// Every node touched by an edge in `edges`. Used to decide which nodes
+    /// stay full-opacity and which fade out.
+    nodes: HashSet<NodeId>,
 }
 
 struct EditorPromptState {
@@ -54,6 +68,10 @@ pub struct GruffApp {
     /// Deferred "frame this cycle in the viewport" request set by the sidebar
     /// and consumed by `draw_canvas` (which has the screen rect in hand).
     frame_request: Option<usize>,
+    /// Currently-highlighted dependency chain (set by clicking an edge),
+    /// `None` when no chain is highlighted. Selecting a node or clicking
+    /// empty canvas clears it.
+    highlight: Option<PathHighlight>,
     selected: Option<NodeId>,
     camera: Vec2,
     zoom: f32,
@@ -81,6 +99,7 @@ impl Default for GruffApp {
             cycles: Vec::new(),
             cycle_of: HashMap::new(),
             frame_request: None,
+            highlight: None,
             selected: None,
             camera: Vec2::new(0.0, 0.0),
             zoom: 1.0,
@@ -159,6 +178,7 @@ impl GruffApp {
             }
         }
         self.frame_request = None;
+        self.highlight = None;
 
         self.layout = Layout::new();
         self.layout.sync(&self.graph);
@@ -262,7 +282,59 @@ impl GruffApp {
             .get(id)
             .map(|v| v.len())
             .unwrap_or(0) as f32;
-        (4.0 + deps.sqrt() * 2.0) * zoom_scale
+        // Sqrt keeps the growth gentle; capping the dependents bonus prevents
+        // a single megahub (1000+ dependents) from dwarfing every other node
+        // into visual noise. The cap is world-units; the full radius is
+        // zoomed afterwards so hotspots still scale with viewport zoom.
+        let deps_bonus = (deps.sqrt() * 2.0).min(24.0);
+        (4.0 + deps_bonus) * zoom_scale
+    }
+
+    /// Find the edge whose on-screen line segment is closest to `screen_pos`,
+    /// within a pixel-distance tolerance. Returns `None` if nothing is close
+    /// enough. Works purely in screen space so the hit tolerance is a fixed
+    /// pixel distance regardless of zoom.
+    fn pick_edge(
+        &self,
+        screen_pos: egui::Pos2,
+        screen_center: egui::Pos2,
+    ) -> Option<(NodeId, NodeId)> {
+        // 5 px is comfortable on a trackpad without making edges impossible
+        // to miss when the user actually meant to click empty canvas.
+        const EDGE_HIT_PX: f32 = 5.0;
+        let mut best: Option<(f32, (NodeId, NodeId))> = None;
+        for edge in &self.graph.edges {
+            let (Some(pa), Some(pb)) = (self.layout.get(&edge.from), self.layout.get(&edge.to))
+            else {
+                continue;
+            };
+            let a = self.world_to_screen(pa, screen_center);
+            let b = self.world_to_screen(pb, screen_center);
+            let d = point_to_segment_distance(screen_pos, a, b);
+            if d <= EDGE_HIT_PX {
+                match &best {
+                    Some((bd, _)) if *bd <= d => {}
+                    _ => best = Some((d, (edge.from.clone(), edge.to.clone()))),
+                }
+            }
+        }
+        best.map(|(_, e)| e)
+    }
+
+    /// Build a [`PathHighlight`] for the clicked edge `u -> v`: walk backward
+    /// from `u` collecting ancestors and forward from `v` collecting
+    /// descendants, then gather every edge whose endpoints both lie in one
+    /// of those reachable sets. The result represents every simple path
+    /// through the graph that passes through the clicked edge. BFS uses a
+    /// visited set, so cyclic regions don't cause infinite loops.
+    fn build_path_highlight(&self, from: &NodeId, to: &NodeId) -> PathHighlight {
+        compute_path_highlight(
+            from,
+            to,
+            &self.graph.edges,
+            &self.imports,
+            &self.imported_by,
+        )
     }
 
     /// Find the topmost node at `screen_pos` within its visible radius.
@@ -679,6 +751,94 @@ impl GruffApp {
     }
 }
 
+/// Shortest distance from a point to a line segment in 2D (screen space).
+/// Used by edge hit-testing so clicking near an edge — not just exactly on
+/// its 1 px stroke — still selects it.
+fn point_to_segment_distance(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+    let abx = b.x - a.x;
+    let aby = b.y - a.y;
+    let len_sq = abx * abx + aby * aby;
+    if len_sq < f32::EPSILON {
+        // Degenerate segment (a == b): fall back to point-to-point distance.
+        let dx = p.x - a.x;
+        let dy = p.y - a.y;
+        return (dx * dx + dy * dy).sqrt();
+    }
+    let apx = p.x - a.x;
+    let apy = p.y - a.y;
+    // Clamp to [0, 1] so we only measure against the segment, not the
+    // infinite line it sits on — near-colinear clicks past the endpoints
+    // correctly measure to the endpoint.
+    let t = ((apx * abx + apy * aby) / len_sq).clamp(0.0, 1.0);
+    let projx = a.x + t * abx;
+    let projy = a.y + t * aby;
+    let dx = p.x - projx;
+    let dy = p.y - projy;
+    (dx * dx + dy * dy).sqrt()
+}
+
+/// Pure path-highlight builder: collect every edge that lies on a path
+/// passing through the clicked edge `(from -> to)`. Factored out of
+/// [`GruffApp`] so it can be unit-tested without standing up an egui
+/// context.
+fn compute_path_highlight(
+    from: &NodeId,
+    to: &NodeId,
+    edges: &[Edge],
+    imports: &HashMap<NodeId, Vec<NodeId>>,
+    imported_by: &HashMap<NodeId, Vec<NodeId>>,
+) -> PathHighlight {
+    // Backward reach from `from` along reverse edges — every ancestor whose
+    // imports can eventually land on `from`. Forward reach from `to` along
+    // forward edges — every descendant `to` can reach. Together these bound
+    // the set of nodes that lie on any path through the clicked edge.
+    let upstream = bfs_visit(from, imported_by);
+    let downstream = bfs_visit(to, imports);
+
+    let mut hl_edges: HashSet<(NodeId, NodeId)> = HashSet::new();
+    hl_edges.insert((from.clone(), to.clone()));
+    for e in edges {
+        // An edge is on some path through (from -> to) iff both endpoints
+        // live in the same reach set. Crossing sets (e.g. an ancestor
+        // pointing into a descendant without going through the clicked
+        // edge) are intentionally excluded — they aren't a chain through
+        // the clicked edge.
+        let in_up = upstream.contains(&e.from) && upstream.contains(&e.to);
+        let in_down = downstream.contains(&e.from) && downstream.contains(&e.to);
+        if in_up || in_down {
+            hl_edges.insert((e.from.clone(), e.to.clone()));
+        }
+    }
+
+    let mut nodes: HashSet<NodeId> = HashSet::new();
+    nodes.extend(upstream);
+    nodes.extend(downstream);
+    PathHighlight {
+        edges: hl_edges,
+        nodes,
+    }
+}
+
+/// Iterative BFS over `adj` starting from `start`, returning every visited
+/// node (including `start`). The visited set is what makes this safe on
+/// cyclic graphs: a node only ever gets pushed once.
+fn bfs_visit(start: &NodeId, adj: &HashMap<NodeId, Vec<NodeId>>) -> HashSet<NodeId> {
+    let mut seen: HashSet<NodeId> = HashSet::new();
+    let mut stack: Vec<NodeId> = Vec::new();
+    seen.insert(start.clone());
+    stack.push(start.clone());
+    while let Some(n) = stack.pop() {
+        if let Some(neighbors) = adj.get(&n) {
+            for nb in neighbors {
+                if seen.insert(nb.clone()) {
+                    stack.push(nb.clone());
+                }
+            }
+        }
+    }
+    seen
+}
+
 fn render_list(ui: &mut egui::Ui, title: &str, items: &[NodeId]) {
     let header = format!("{} ({})", title, items.len());
     egui::CollapsingHeader::new(header)
@@ -728,11 +888,14 @@ impl eframe::App for GruffApp {
         }
 
         // Escape deselects, or dismisses the editor prompt if it's open.
+        // Also clears any active edge-path highlight so `Escape` is a
+        // universal "go back to a clean canvas" key.
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if self.editor_prompt.is_some() {
                 self.editor_prompt = None;
             } else {
                 self.selected = None;
+                self.highlight = None;
             }
         }
 
@@ -826,10 +989,22 @@ impl GruffApp {
             self.camera.y -= delta.y / self.zoom;
         }
 
-        // Click handling: select a node under the pointer, or deselect on empty.
+        // Click handling: nodes take priority over edges (the hit radius is
+        // tighter than the edge tolerance, and the user almost always meant
+        // the node when both are under the cursor). An empty-canvas click
+        // clears both the selection and any active path highlight.
         if response.clicked() {
             if let Some(click_pos) = response.interact_pointer_pos() {
-                self.selected = self.pick_node(click_pos, center);
+                if let Some(node) = self.pick_node(click_pos, center) {
+                    self.selected = Some(node);
+                    self.highlight = None;
+                } else if let Some((from, to)) = self.pick_edge(click_pos, center) {
+                    self.highlight = Some(self.build_path_highlight(&from, &to));
+                    self.selected = None;
+                } else {
+                    self.selected = None;
+                    self.highlight = None;
+                }
             }
         }
 
@@ -846,10 +1021,11 @@ impl GruffApp {
         }
 
         let painter = ui.painter_at(rect);
-        let normal_stroke = egui::Stroke::new(1.0, colors::EDGE);
-        // Cycle edges get a slightly thicker stroke on top of the red tint so
-        // they pop even when the canvas is busy.
-        let cycle_stroke = egui::Stroke::new(1.6, colors::CYCLE_EDGE);
+        // Dim non-highlighted elements so the highlighted chain reads clearly.
+        // Alpha roughly preserves the layout shape in the background without
+        // competing with the highlighted edges for attention.
+        const DIM_ALPHA: f32 = 0.18;
+        let highlight_active = self.highlight.is_some();
 
         // Edges first so nodes overlap them.
         for edge in &self.graph.edges {
@@ -859,12 +1035,32 @@ impl GruffApp {
             };
             let a = self.world_to_screen(pa, center);
             let b = self.world_to_screen(pb, center);
-            let stroke = if self.edge_in_cycle(&edge.from, &edge.to) {
-                cycle_stroke
+            let is_cycle = self.edge_in_cycle(&edge.from, &edge.to);
+            let on_path = self
+                .highlight
+                .as_ref()
+                .is_some_and(|h| h.edges.contains(&(edge.from.clone(), edge.to.clone())));
+
+            // Base color: cycle edges keep their red identity even when
+            // highlighted — the highlight manifests as increased width /
+            // opacity rather than overwriting the cycle signal.
+            let base = if is_cycle {
+                colors::CYCLE_EDGE
+            } else if on_path {
+                colors::PATH_EDGE
             } else {
-                normal_stroke
+                colors::EDGE
             };
-            painter.line_segment([a, b], stroke);
+            let (width, color) = if on_path {
+                (2.0, base)
+            } else if highlight_active {
+                (1.0, base.gamma_multiply(DIM_ALPHA))
+            } else if is_cycle {
+                (1.6, base)
+            } else {
+                (1.0, base)
+            };
+            painter.line_segment([a, b], egui::Stroke::new(width, color));
         }
 
         let zoom_scale = self.zoom.clamp(0.5, 2.0);
@@ -872,10 +1068,21 @@ impl GruffApp {
             let p = self.world_to_screen(pos, center);
             let radius = self.node_render_radius(id, zoom_scale);
             let is_selected = self.selected.as_ref() == Some(id);
-            let color = if is_selected {
+            let on_path = self
+                .highlight
+                .as_ref()
+                .is_some_and(|h| h.nodes.contains(id));
+            let base = if is_selected {
                 colors::SELECTED
             } else {
                 self.node_color(id)
+            };
+            // Fade nodes that aren't on the highlighted chain; keep the
+            // selected node fully opaque even when no chain is active.
+            let color = if highlight_active && !on_path && !is_selected {
+                base.gamma_multiply(DIM_ALPHA)
+            } else {
+                base
             };
             painter.circle_filled(p, radius, color);
             if is_selected {
@@ -905,5 +1112,152 @@ impl GruffApp {
                 colors::HINT,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::Edge;
+
+    fn id(s: &str) -> NodeId {
+        s.to_string()
+    }
+
+    /// Build forward/reverse adjacency lists from a flat edge list, matching
+    /// the shape `GruffApp` caches at load time.
+    fn adj(edges: &[Edge]) -> (HashMap<NodeId, Vec<NodeId>>, HashMap<NodeId, Vec<NodeId>>) {
+        let mut fwd: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        let mut rev: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for e in edges {
+            fwd.entry(e.from.clone()).or_default().push(e.to.clone());
+            rev.entry(e.to.clone()).or_default().push(e.from.clone());
+        }
+        (fwd, rev)
+    }
+
+    fn edge(from: &str, to: &str) -> Edge {
+        Edge {
+            from: from.to_string(),
+            to: to.to_string(),
+        }
+    }
+
+    #[test]
+    fn linear_chain_click_middle_highlights_everything() {
+        // a -> b -> c -> d : clicking (b -> c) should highlight every edge
+        // and every node — the chain fills the graph.
+        let edges = vec![edge("a", "b"), edge("b", "c"), edge("c", "d")];
+        let (fwd, rev) = adj(&edges);
+        let hl = compute_path_highlight(&id("b"), &id("c"), &edges, &fwd, &rev);
+        assert!(hl.edges.contains(&(id("a"), id("b"))));
+        assert!(hl.edges.contains(&(id("b"), id("c"))));
+        assert!(hl.edges.contains(&(id("c"), id("d"))));
+        assert_eq!(hl.edges.len(), 3);
+        for n in ["a", "b", "c", "d"] {
+            assert!(hl.nodes.contains(&id(n)), "expected node {n} in highlight");
+        }
+    }
+
+    #[test]
+    fn branching_graph_excludes_sibling_branches() {
+        //        /-> x
+        //   a -> b -> c -> d
+        //        \-> y
+        // Clicking (b -> c) should include a and d (on the chain) but NOT
+        // x or y — they branch away from the clicked edge.
+        let edges = vec![
+            edge("a", "b"),
+            edge("b", "c"),
+            edge("c", "d"),
+            edge("b", "x"),
+            edge("b", "y"),
+        ];
+        let (fwd, rev) = adj(&edges);
+        let hl = compute_path_highlight(&id("b"), &id("c"), &edges, &fwd, &rev);
+        assert!(hl.nodes.contains(&id("a")));
+        assert!(hl.nodes.contains(&id("d")));
+        assert!(!hl.nodes.contains(&id("x")));
+        assert!(!hl.nodes.contains(&id("y")));
+        // And the sibling-branch edges are excluded from the highlight.
+        assert!(!hl.edges.contains(&(id("b"), id("x"))));
+        assert!(!hl.edges.contains(&(id("b"), id("y"))));
+    }
+
+    #[test]
+    fn cycle_does_not_cause_infinite_loop() {
+        // a -> b -> c -> a forms a cycle. Clicking any edge inside the cycle
+        // should terminate and highlight every member edge.
+        let edges = vec![edge("a", "b"), edge("b", "c"), edge("c", "a")];
+        let (fwd, rev) = adj(&edges);
+        let hl = compute_path_highlight(&id("a"), &id("b"), &edges, &fwd, &rev);
+        assert_eq!(hl.edges.len(), 3);
+        assert_eq!(hl.nodes.len(), 3);
+        for from_to in [("a", "b"), ("b", "c"), ("c", "a")] {
+            assert!(
+                hl.edges.contains(&(id(from_to.0), id(from_to.1))),
+                "missing cycle edge {from_to:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cycle_with_external_tail_and_head() {
+        // root -> a -> b -> a (cycle a<->b) -> c -> leaf
+        // Clicking (a -> b) inside the cycle should reach root (upstream of
+        // the cycle) and leaf (downstream of the cycle) — the full chain —
+        // without looping.
+        let edges = vec![
+            edge("root", "a"),
+            edge("a", "b"),
+            edge("b", "a"),
+            edge("b", "c"),
+            edge("c", "leaf"),
+        ];
+        let (fwd, rev) = adj(&edges);
+        let hl = compute_path_highlight(&id("a"), &id("b"), &edges, &fwd, &rev);
+        for n in ["root", "a", "b", "c", "leaf"] {
+            assert!(hl.nodes.contains(&id(n)), "expected {n} in path highlight");
+        }
+    }
+
+    #[test]
+    fn unrelated_component_is_not_highlighted() {
+        // Two disjoint chains: clicking one must leave the other dim.
+        let edges = vec![
+            edge("a", "b"),
+            edge("b", "c"),
+            edge("x", "y"),
+            edge("y", "z"),
+        ];
+        let (fwd, rev) = adj(&edges);
+        let hl = compute_path_highlight(&id("a"), &id("b"), &edges, &fwd, &rev);
+        assert!(hl.nodes.contains(&id("a")));
+        assert!(hl.nodes.contains(&id("c")));
+        assert!(!hl.nodes.contains(&id("x")));
+        assert!(!hl.nodes.contains(&id("y")));
+        assert!(!hl.nodes.contains(&id("z")));
+    }
+
+    #[test]
+    fn point_to_segment_distance_clamps_to_endpoints() {
+        let a = egui::pos2(0.0, 0.0);
+        let b = egui::pos2(10.0, 0.0);
+
+        // Midpoint perpendicular.
+        let d_mid = point_to_segment_distance(egui::pos2(5.0, 3.0), a, b);
+        assert!((d_mid - 3.0).abs() < 0.001);
+
+        // Past the endpoint — must measure to the endpoint, not the line.
+        let d_past = point_to_segment_distance(egui::pos2(20.0, 0.0), a, b);
+        assert!((d_past - 10.0).abs() < 0.001);
+
+        // On the segment — zero distance.
+        let d_on = point_to_segment_distance(egui::pos2(5.0, 0.0), a, b);
+        assert!(d_on < 0.001);
+
+        // Degenerate zero-length segment falls back to point distance.
+        let d_degen = point_to_segment_distance(egui::pos2(3.0, 4.0), a, a);
+        assert!((d_degen - 5.0).abs() < 0.001);
     }
 }
