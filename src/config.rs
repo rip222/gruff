@@ -16,6 +16,11 @@ pub struct Config {
     pub editor: EditorConfig,
     #[serde(default)]
     pub watch: WatchConfig,
+    /// Path of the most recently opened repo. Re-opened on next launch if
+    /// the path still exists and is readable. Layout, selection, and filter
+    /// state are deliberately *not* persisted — each session starts fresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_repo: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -120,10 +125,35 @@ mod tests {
                 name: "nvim".to_string(),
             },
             watch: WatchConfig { debounce_ms: 250 },
+            last_repo: None,
         };
         save_to(&path, &cfg).unwrap();
         let reloaded = load_from(&path);
         assert_eq!(cfg, reloaded);
+    }
+
+    #[test]
+    fn last_repo_round_trips() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = Config {
+            last_repo: Some(PathBuf::from("/tmp/some/repo")),
+            ..Config::default()
+        };
+        save_to(&path, &cfg).unwrap();
+        let reloaded = load_from(&path);
+        assert_eq!(reloaded.last_repo, Some(PathBuf::from("/tmp/some/repo")));
+    }
+
+    #[test]
+    fn last_repo_absent_when_not_set() {
+        // The `skip_serializing_if` attribute keeps the config file clean when
+        // no repo has been opened yet — no stray `last_repo = ""` line.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        save_to(&path, &Config::default()).unwrap();
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(!body.contains("last_repo"), "body was: {body}");
     }
 
     #[test]

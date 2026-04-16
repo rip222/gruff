@@ -115,6 +115,20 @@ impl Default for GruffApp {
 }
 
 impl GruffApp {
+    /// Build a fresh app and, if the config records a `last_repo` that still
+    /// points at a readable directory, auto-open it so the user doesn't have
+    /// to re-drop the folder every session. A missing or stale path silently
+    /// falls back to the onboarding hint — same state as a first launch.
+    pub fn with_autoload() -> Self {
+        let mut app = Self::default();
+        if let Some(path) = app.config.last_repo.clone() {
+            if is_readable_dir(&path) {
+                app.load_folder(path);
+            }
+        }
+        app
+    }
+
     fn load_folder(&mut self, path: PathBuf) {
         let start = Instant::now();
         let mut indexer = Indexer::build(&path);
@@ -125,8 +139,18 @@ impl GruffApp {
         }
         self.graph = indexer.graph.clone();
         self.unresolved_dynamic = indexer.unresolved_dynamic;
-        self.last_root = Some(indexer.ws.root.clone());
+        let root = indexer.ws.root.clone();
+        self.last_root = Some(root.clone());
         self.indexer = Some(indexer);
+
+        // Remember this repo so the next launch re-opens it. Per the PRD this
+        // is the *only* thing persisted across sessions — layout, selection,
+        // and filter state are deliberately session-scoped. A write failure
+        // just means the user won't get auto-reopen; don't surface it.
+        if self.config.last_repo.as_ref() != Some(&root) {
+            self.config.last_repo = Some(root);
+            let _ = config::save(&self.config);
+        }
 
         self.rebuild_derived_indexes();
         self.frame_request = None;
@@ -379,6 +403,13 @@ impl GruffApp {
         }
         true
     }
+}
+
+/// True if `path` is a directory we can list. Used to decide whether a
+/// `last_repo` entry is still live enough to auto-open — a successful
+/// `read_dir` implies existence, readability, and that it isn't a plain file.
+fn is_readable_dir(path: &std::path::Path) -> bool {
+    std::fs::read_dir(path).is_ok()
 }
 
 /// Append `src` into `dst`, preserving ordering (removals first, additions

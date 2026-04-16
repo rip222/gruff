@@ -21,7 +21,7 @@ fn main() -> eframe::Result {
         native_options,
         Box::new(|cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            Ok(Box::<GruffApp>::default())
+            Ok(Box::new(GruffApp::with_autoload()))
         }),
     )
 }
