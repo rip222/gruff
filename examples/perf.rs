@@ -11,6 +11,7 @@ fn main() {
                 id: i.to_string(),
                 path: PathBuf::new(),
                 label: String::new(),
+                package: None,
             });
         }
         // sprinkle edges — roughly 2 per node

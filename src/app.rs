@@ -18,6 +18,16 @@ pub struct GruffApp {
     /// index order is whatever the first sweep through `graph.nodes` produced —
     /// good enough for deterministic colors within a single session.
     package_indices: HashMap<String, usize>,
+    /// Cyclic SCCs reported by `Graph::cycles`. Each entry is the node set of
+    /// one circular-dependency region. Recomputed on every load.
+    cycles: Vec<Vec<NodeId>>,
+    /// Reverse index: for each node participating in a cycle, the index into
+    /// `cycles` of the SCC it belongs to. Used to tint cycle edges red in O(1)
+    /// and to surface "cycles this file participates in" in the sidebar.
+    cycle_of: HashMap<NodeId, usize>,
+    /// Deferred "frame this cycle in the viewport" request set by the sidebar
+    /// and consumed by `draw_canvas` (which has the screen rect in hand).
+    frame_request: Option<usize>,
     selected: Option<NodeId>,
     camera: Vec2,
     zoom: f32,
@@ -33,6 +43,9 @@ impl Default for GruffApp {
             imports: HashMap::new(),
             imported_by: HashMap::new(),
             package_indices: HashMap::new(),
+            cycles: Vec::new(),
+            cycle_of: HashMap::new(),
+            frame_request: None,
             selected: None,
             camera: Vec2::new(0.0, 0.0),
             zoom: 1.0,
@@ -85,6 +98,28 @@ impl GruffApp {
             self.package_indices.insert(name.to_string(), next);
         }
 
+        // Detect cycles once per load. Tarjan's is O(V+E) so this is cheap
+        // even on large graphs, and lets every frame look up cycle membership
+        // in O(1) via `cycle_of` rather than re-running SCC.
+        self.cycles = self.graph.cycles();
+        // Sort cycle members for stable sidebar presentation. Tarjan's returns
+        // them in stack-pop order, which is deterministic per-run but visually
+        // arbitrary — alphabetical reads better in a list.
+        for cycle in &mut self.cycles {
+            cycle.sort();
+        }
+        // Sort cycles themselves by their smallest member so the list order
+        // stays stable across reruns of the same graph.
+        self.cycles
+            .sort_by(|a, b| a.first().cmp(&b.first()).then(a.len().cmp(&b.len())));
+        self.cycle_of.clear();
+        for (idx, cycle) in self.cycles.iter().enumerate() {
+            for node in cycle {
+                self.cycle_of.insert(node.clone(), idx);
+            }
+        }
+        self.frame_request = None;
+
         self.layout = Layout::new();
         self.layout.sync(&self.graph);
         self.selected = None;
@@ -92,11 +127,57 @@ impl GruffApp {
         self.zoom = 1.0;
         self.sim_enabled = true;
         self.status = format!(
-            "{} files, {} edges — indexed in {:.2}s",
+            "{} files, {} edges, {} cycle{} — indexed in {:.2}s",
             self.graph.nodes.len(),
             self.graph.edges.len(),
+            self.cycles.len(),
+            if self.cycles.len() == 1 { "" } else { "s" },
             start.elapsed().as_secs_f32(),
         );
+    }
+
+    /// True when this edge lies inside a cyclic SCC. An edge `(u,v)` is on a
+    /// cycle iff `u` and `v` sit in the same SCC *and* that SCC is itself
+    /// cyclic (multi-node or self-loop) — which is exactly the condition
+    /// `cycle_of` encodes (it only maps nodes that participate in a cycle).
+    fn edge_in_cycle(&self, from: &str, to: &str) -> bool {
+        match (self.cycle_of.get(from), self.cycle_of.get(to)) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    /// Center and zoom the viewport so cycle `idx`'s members fit inside the
+    /// canvas rect with a comfortable margin. Self-loop cycles (single node,
+    /// zero-size bbox) are handled by falling back to a generous fixed zoom.
+    fn frame_cycle(&mut self, idx: usize, rect: egui::Rect) {
+        let Some(cycle) = self.cycles.get(idx) else {
+            return;
+        };
+        let mut positions = cycle.iter().filter_map(|id| self.layout.get(id));
+        let Some(first) = positions.next() else {
+            return;
+        };
+        let (mut min_x, mut max_x, mut min_y, mut max_y) =
+            (first.x, first.x, first.y, first.y);
+        for p in positions {
+            min_x = min_x.min(p.x);
+            max_x = max_x.max(p.x);
+            min_y = min_y.min(p.y);
+            max_y = max_y.max(p.y);
+        }
+        self.camera = Vec2::new((min_x + max_x) * 0.5, (min_y + max_y) * 0.5);
+
+        // Padding leaves breathing room around the framed cycle so nodes
+        // aren't jammed against the viewport edge. Additive (in world units)
+        // rather than multiplicative so a single self-loop doesn't collapse
+        // to zero padding.
+        const PAD: f32 = 60.0;
+        let bbox_w = (max_x - min_x) + PAD * 2.0;
+        let bbox_h = (max_y - min_y) + PAD * 2.0;
+        let fit_x = rect.width() / bbox_w.max(1.0);
+        let fit_y = rect.height() / bbox_h.max(1.0);
+        self.zoom = fit_x.min(fit_y).clamp(0.05, 20.0);
     }
 
     fn world_to_screen(&self, world: Vec2, screen_center: egui::Pos2) -> egui::Pos2 {
@@ -154,6 +235,15 @@ impl GruffApp {
     }
 
     fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
+        if self.selected.is_some() {
+            self.draw_selection_pane(ui);
+            ui.add_space(12.0);
+            ui.separator();
+        }
+        self.draw_cycles_pane(ui);
+    }
+
+    fn draw_selection_pane(&mut self, ui: &mut egui::Ui) {
         let Some(selected) = self.selected.clone() else {
             return;
         };
@@ -213,8 +303,69 @@ impl GruffApp {
                 .color(colors::HINT)
                 .small(),
         );
-        // Left empty until cycle detection (slice #7).
-        ui.label(egui::RichText::new("(pending cycle detection)").italics());
+        match self.cycle_of.get(&selected).copied() {
+            Some(idx) => {
+                // The selected file participates in exactly one SCC — render
+                // it as a button that frames the whole cycle in the viewport,
+                // same affordance as the "Cycles" section below.
+                let size = self.cycles[idx].len();
+                let label = format!("Cycle {}  ·  {size} files", idx + 1);
+                if ui.button(label).clicked() {
+                    self.frame_request = Some(idx);
+                }
+            }
+            None => {
+                ui.label(egui::RichText::new("(none)").italics().color(colors::HINT));
+            }
+        }
+    }
+
+    fn draw_cycles_pane(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        ui.heading(format!("Cycles ({})", self.cycles.len()));
+        ui.add_space(4.0);
+
+        if self.cycles.is_empty() {
+            ui.label(
+                egui::RichText::new("No circular dependencies detected.")
+                    .italics()
+                    .color(colors::HINT),
+            );
+            return;
+        }
+
+        // Scroll-contain the cycle list so a repo with many cycles doesn't
+        // push the selection pane off-screen.
+        egui::ScrollArea::vertical()
+            .id_salt("cycles-list")
+            .max_height(260.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for (idx, cycle) in self.cycles.iter().enumerate() {
+                    let label = format!("Cycle {}  ·  {} files", idx + 1, cycle.len());
+                    // Button is full-width so the whole row is the click target.
+                    let resp = ui.add(egui::Button::new(label).min_size(egui::vec2(
+                        ui.available_width(),
+                        0.0,
+                    )));
+                    if resp.clicked() {
+                        self.frame_request = Some(idx);
+                    }
+                    // Small preview of member files under each cycle, capped
+                    // to keep long cycles from dominating the sidebar.
+                    egui::CollapsingHeader::new("files")
+                        .id_salt(idx)
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            for node_id in cycle {
+                                ui.label(
+                                    egui::RichText::new(node_id).monospace().small(),
+                                );
+                            }
+                        });
+                    ui.add_space(2.0);
+                }
+            });
     }
 }
 
@@ -297,9 +448,10 @@ impl eframe::App for GruffApp {
             ctx.request_repaint();
         }
 
-        // Sidebar only appears when something is selected — it's the surface
-        // that later slices will plug more content into.
-        if self.selected.is_some() {
+        // Sidebar appears whenever there's content worth showing: a current
+        // selection or at least one detected cycle. Keeping it hidden on an
+        // empty canvas preserves the onboarding-only initial screen.
+        if self.selected.is_some() || !self.cycles.is_empty() {
             egui::Panel::left("sidebar")
                 .resizable(true)
                 .default_size(280.0)
@@ -324,6 +476,12 @@ impl GruffApp {
         let ctx = ui.ctx().clone();
         let rect = ui.max_rect();
         let center = rect.center();
+
+        // Consume any pending "frame this cycle" request before drawing, so
+        // the updated camera applies to this frame rather than lagging by one.
+        if let Some(idx) = self.frame_request.take() {
+            self.frame_cycle(idx, rect);
+        }
 
         let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
@@ -353,7 +511,10 @@ impl GruffApp {
         }
 
         let painter = ui.painter_at(rect);
-        let edge_stroke = egui::Stroke::new(1.0, colors::EDGE);
+        let normal_stroke = egui::Stroke::new(1.0, colors::EDGE);
+        // Cycle edges get a slightly thicker stroke on top of the red tint so
+        // they pop even when the canvas is busy.
+        let cycle_stroke = egui::Stroke::new(1.6, colors::CYCLE_EDGE);
 
         // Edges first so nodes overlap them.
         for edge in &self.graph.edges {
@@ -363,7 +524,12 @@ impl GruffApp {
             };
             let a = self.world_to_screen(pa, center);
             let b = self.world_to_screen(pb, center);
-            painter.line_segment([a, b], edge_stroke);
+            let stroke = if self.edge_in_cycle(&edge.from, &edge.to) {
+                cycle_stroke
+            } else {
+                normal_stroke
+            };
+            painter.line_segment([a, b], stroke);
         }
 
         let zoom_scale = self.zoom.clamp(0.5, 2.0);
