@@ -181,7 +181,7 @@ impl GruffApp {
                     draw_unpackaged_bucket(ui, &tree.unpackaged, &mut toggles);
                 }
                 if !tree.externals.externals.is_empty() {
-                    draw_externals_bucket(ui, &tree.externals);
+                    draw_externals_bucket(ui, &tree.externals, &mut toggles);
                 }
             });
 
@@ -235,10 +235,11 @@ impl GruffApp {
 }
 
 /// Render a single workspace-package subtree. The header row combines the
-/// collapsing disclosure triangle, the package-level checkbox (still inert
-/// pending #23), the color swatch, and the package name; the body holds
-/// nested folders and files. Collapsed by default per the issue's
-/// acceptance criteria. File checkbox toggles bubble up through `toggles`.
+/// collapsing disclosure triangle, the package-level tristate checkbox, the
+/// color swatch, and the package name; the body holds nested folders and
+/// files. Collapsed by default per the issue's acceptance criteria. File
+/// checkbox toggles — including cascades from a parent click — bubble up
+/// through `toggles`.
 fn draw_package_node(ui: &mut egui::Ui, pkg: &PackageNode, toggles: &mut Vec<NodeId>) {
     let id = ui.make_persistent_id(format!("pkg-tree:pkg:{}", pkg.name));
     let state = egui::collapsing_header::CollapsingState::load_with_default_open(
@@ -249,11 +250,12 @@ fn draw_package_node(ui: &mut egui::Ui, pkg: &PackageNode, toggles: &mut Vec<Nod
     let check_id = format!("pkg-check:{}", pkg.name);
     state
         .show_header(ui, |ui| {
-            // Package-level checkbox is still inert in this slice —
-            // tristate/cascade behavior is deferred to #23. We ignore any
-            // flip the user makes so the rendered state keeps matching
-            // what `PackageTree::build` said it should be.
-            draw_inert_check(ui, &check_id, pkg.check);
+            // Package-level checkbox cascades the click over every
+            // descendant file leaf. The rule mirrors the tree's fold:
+            // fully checked → hide all; unchecked or mixed → show all.
+            if draw_tristate_check(ui, &check_id, pkg.check) {
+                toggles.extend(collect_package_leaves(pkg));
+            }
             draw_color_swatch(ui, pkg.color_index);
             ui.label(egui::RichText::new(&pkg.name).monospace());
         })
@@ -278,7 +280,7 @@ fn draw_folder_child(
         FolderChild::File(file) => {
             let id = format!("{parent_salt}:file:{}", file.id);
             ui.horizontal(|ui| {
-                if draw_live_check(ui, &id, file.check) {
+                if draw_tristate_check(ui, &id, file.check) {
                     toggles.push(file.id.clone());
                 }
                 ui.label(egui::RichText::new(&file.label).monospace().small());
@@ -303,8 +305,10 @@ fn draw_folder_node(
     let check_id = format!("{salt}:check");
     state
         .show_header(ui, |ui| {
-            // Folder-level checkbox stays inert pending #23.
-            draw_inert_check(ui, &check_id, folder.check);
+            // Folder-level checkbox cascades the same way as a package row.
+            if draw_tristate_check(ui, &check_id, folder.check) {
+                toggles.extend(collect_folder_leaves(folder));
+            }
             ui.label(egui::RichText::new(&folder.name).monospace());
         })
         .body(|ui| {
@@ -328,15 +332,21 @@ fn draw_unpackaged_bucket(
     );
     state
         .show_header(ui, |ui| {
-            // Bucket-level checkbox inert pending #23.
-            draw_inert_check(ui, "unpackaged:check", bucket.check);
+            // Bucket-level checkbox cascades over the flat file list.
+            if draw_tristate_check(ui, "unpackaged:check", bucket.check) {
+                for f in &bucket.files {
+                    if should_emit_leaf(bucket.check, f.check) {
+                        toggles.push(f.id.clone());
+                    }
+                }
+            }
             ui.label(egui::RichText::new(UNPACKAGED_LABEL).italics());
         })
         .body(|ui| {
             for file in &bucket.files {
                 let id = format!("{salt}:file:{}", file.id);
                 ui.horizontal(|ui| {
-                    if draw_live_check(ui, &id, file.check) {
+                    if draw_tristate_check(ui, &id, file.check) {
                         toggles.push(file.id.clone());
                     }
                     ui.label(egui::RichText::new(&file.label).monospace().small());
@@ -345,7 +355,11 @@ fn draw_unpackaged_bucket(
         });
 }
 
-fn draw_externals_bucket(ui: &mut egui::Ui, bucket: &ExternalsBucket) {
+fn draw_externals_bucket(
+    ui: &mut egui::Ui,
+    bucket: &ExternalsBucket,
+    toggles: &mut Vec<NodeId>,
+) {
     let salt = "externals";
     let id = ui.make_persistent_id("pkg-tree:externals");
     let state = egui::collapsing_header::CollapsingState::load_with_default_open(
@@ -355,34 +369,49 @@ fn draw_externals_bucket(ui: &mut egui::Ui, bucket: &ExternalsBucket) {
     );
     state
         .show_header(ui, |ui| {
-            // Externals bucket + each external leaf are still inert in this
-            // slice. Per the issue, #22 wires *file-level* checkboxes only;
-            // externals aren't workspace files and don't enter the
-            // file-level hide path.
-            draw_inert_check(ui, "externals:check", bucket.check);
+            // Externals bucket cascades the same way — externals share the
+            // same `FilterState` hide set as workspace files, so toggling
+            // an external id routes through `toggle_file_visibility`
+            // uniformly.
+            if draw_tristate_check(ui, "externals:check", bucket.check) {
+                for e in &bucket.externals {
+                    if should_emit_leaf(bucket.check, e.check) {
+                        toggles.push(e.id.clone());
+                    }
+                }
+            }
             ui.label(egui::RichText::new(EXTERNALS_LABEL).italics());
         })
         .body(|ui| {
             for ext in &bucket.externals {
                 let id = format!("{salt}:ext:{}", ext.id);
                 ui.horizontal(|ui| {
-                    draw_inert_check(ui, &id, ext.check);
+                    if draw_tristate_check(ui, &id, ext.check) {
+                        toggles.push(ext.id.clone());
+                    }
                     ui.label(egui::RichText::new(&ext.label).monospace().small());
                 });
             }
         });
 }
 
-/// Render a checkbox that forwards user clicks to the caller. Returns
-/// `true` on the frame where the user toggled it — the caller appends the
-/// corresponding node id to a pending-toggles batch and applies the change
-/// once the frame's UI tree finishes walking.
-fn draw_live_check(ui: &mut egui::Ui, id: &str, state: CheckState) -> bool {
-    let mut checked = matches!(state, CheckState::Checked | CheckState::Mixed);
+/// Draw a checkbox that renders `Mixed` as the native tristate/indeterminate
+/// style, `Checked` as on, and `Unchecked` as off. Returns `true` on the
+/// frame where the user toggled it — the caller decides whether that maps
+/// to a single-file toggle or a cascading parent click. The `checked` and
+/// `indeterminate` bindings are scratch; the rendered state is re-derived
+/// from `PackageTree::build` on every frame, so any mutation here is
+/// overwritten next paint.
+fn draw_tristate_check(ui: &mut egui::Ui, id: &str, state: CheckState) -> bool {
     let mut toggled = false;
     ui.scope(|ui| {
         ui.push_id(id, |ui| {
-            if ui.checkbox(&mut checked, "").changed() {
+            let mut checked = matches!(state, CheckState::Checked);
+            let indeterminate = matches!(state, CheckState::Mixed);
+            let response = ui.add(
+                egui::Checkbox::new(&mut checked, "").indeterminate(indeterminate),
+            );
+            if response.changed() {
                 toggled = true;
             }
         });
@@ -390,17 +419,52 @@ fn draw_live_check(ui: &mut egui::Ui, id: &str, state: CheckState) -> bool {
     toggled
 }
 
-/// Render a checkbox whose flip is intentionally ignored — used for
-/// package/folder/bucket rows pending tristate cascade in #23. The widget
-/// still draws interactively so the user can click it without the app
-/// reacting, matching the original "visible but inert" UX.
-fn draw_inert_check(ui: &mut egui::Ui, id: &str, state: CheckState) {
-    let mut checked = !matches!(state, CheckState::Unchecked);
-    ui.scope(|ui| {
-        ui.push_id(id, |ui| {
-            let _ = ui.checkbox(&mut checked, "");
-        });
-    });
+/// Walk a package subtree and emit the ids that a parent click should flip
+/// given the current check state. The walk is biased: when the parent is
+/// `Checked` we emit every visible leaf (to hide it); when `Unchecked` or
+/// `Mixed` we emit every hidden leaf (to show it). Keeping the filter here
+/// means the caller's toggle batch never contains a no-op flip.
+fn collect_package_leaves(pkg: &PackageNode) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    for child in &pkg.children {
+        collect_child_leaves(child, pkg.check, &mut out);
+    }
+    out
+}
+
+fn collect_folder_leaves(folder: &FolderNode) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    for child in &folder.children {
+        collect_child_leaves(child, folder.check, &mut out);
+    }
+    out
+}
+
+fn collect_child_leaves(child: &FolderChild, parent: CheckState, out: &mut Vec<NodeId>) {
+    match child {
+        FolderChild::File(f) => {
+            if should_emit_leaf(parent, f.check) {
+                out.push(f.id.clone());
+            }
+        }
+        FolderChild::Folder(f) => {
+            for c in &f.children {
+                collect_child_leaves(c, parent, out);
+            }
+        }
+    }
+}
+
+/// True if a leaf in state `leaf` should be toggled when the user clicks a
+/// parent currently in state `parent`. The rule mirrors the PRD cascade:
+/// parent fully on → toggle every currently-on leaf (off), parent off or
+/// mixed → toggle every currently-off leaf (on). Skipping no-op flips keeps
+/// `FilterState::toggle` calls strictly meaningful.
+fn should_emit_leaf(parent: CheckState, leaf: CheckState) -> bool {
+    match parent {
+        CheckState::Checked => matches!(leaf, CheckState::Checked),
+        CheckState::Unchecked | CheckState::Mixed => matches!(leaf, CheckState::Unchecked),
+    }
 }
 
 /// Small color chip matching the selection pane's swatch style. `None` picks

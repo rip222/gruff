@@ -19,9 +19,11 @@
 //! Checkbox state is tracked on every tree node so the sidebar can render a
 //! checkbox at every level. File-level `CheckState` reflects the caller's
 //! [`FilterState`] hide set — hidden files render as `Unchecked`, visible
-//! files render as `Checked`. Package- and folder-level tristate cascade
-//! lands in #23; until then parent rows always render `Checked` regardless
-//! of their descendants.
+//! files render as `Checked`. Package-, folder-, and bucket-level rows use
+//! a tristate derived from their descendants: all leaves checked → `Checked`,
+//! all unchecked → `Unchecked`, any mix → `Mixed`. Per #23 the sidebar
+//! cascades parent clicks over the descendant leaf ids returned by
+//! [`PackageTree::collect_leaf_ids`] and friends.
 //!
 //! Kept egui-free and purely data-driven. See `tests` for structural
 //! assertions that don't require a renderer.
@@ -41,18 +43,45 @@ pub const UNPACKAGED_LABEL: &str = "(unpackaged)";
 pub const EXTERNALS_LABEL: &str = "externals";
 
 /// Three-state checkbox. File-level leaves use `Checked`/`Unchecked` to
-/// reflect the caller's [`FilterState`] hide set. `Mixed` is reserved for
-/// parent rows once tristate/cascade lands in #23; until then parents
-/// always build as `Checked`.
+/// reflect the caller's [`FilterState`] hide set. Parent rows (packages,
+/// folders, unpackaged/externals buckets) roll up their descendants via
+/// [`fold_check_states`]: all leaves checked → `Checked`, all unchecked →
+/// `Unchecked`, any mix → `Mixed`.
 ///
 /// [`FilterState`]: crate::filter_state::FilterState
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckState {
     Checked,
     Unchecked,
-    /// Mixed: some descendants checked, others unchecked. Produced by a
-    /// future filter layer; not yet built by [`PackageTree::build`].
+    /// Mixed: some descendants checked, others unchecked. Rendered as the
+    /// tristate/indeterminate style in the sidebar.
     Mixed,
+}
+
+/// Fold a sequence of child [`CheckState`]s into a parent's rollup:
+/// - empty → `Checked` (vacuous "all checked")
+/// - any `Mixed` descendant → `Mixed`
+/// - otherwise, `Checked` if every child is `Checked`, `Unchecked` if every
+///   child is `Unchecked`, else `Mixed`.
+fn fold_check_states<I: IntoIterator<Item = CheckState>>(states: I) -> CheckState {
+    let mut saw_checked = false;
+    let mut saw_unchecked = false;
+    for s in states {
+        match s {
+            CheckState::Mixed => return CheckState::Mixed,
+            CheckState::Checked => saw_checked = true,
+            CheckState::Unchecked => saw_unchecked = true,
+        }
+        if saw_checked && saw_unchecked {
+            return CheckState::Mixed;
+        }
+    }
+    match (saw_checked, saw_unchecked) {
+        (false, false) => CheckState::Checked, // empty bucket reads as "fully on"
+        (true, false) => CheckState::Checked,
+        (false, true) => CheckState::Unchecked,
+        (true, true) => CheckState::Mixed,
+    }
 }
 
 /// Single-level node under a package subtree. Folders nest folders and files;
@@ -176,9 +205,10 @@ impl PackageTree {
     /// about colors can pass an empty map.
     ///
     /// `hidden` is the current filter's hide set. File leaves whose id is in
-    /// the set render as [`CheckState::Unchecked`]; all other leaves (and
-    /// every parent-level `CheckState`) stay `Checked` in this slice —
-    /// tristate/cascade for package and folder rows lands in #23.
+    /// the set render as [`CheckState::Unchecked`]; visible leaves render as
+    /// `Checked`. Package, folder, and bucket rows fold over their
+    /// descendants: all checked → `Checked`, all unchecked → `Unchecked`,
+    /// any mix → `Mixed`. Empty subtrees roll up as `Checked`.
     ///
     /// Alphabetical ordering is enforced at every level: packages, external
     /// leaves, unpackaged files, and folder/file siblings under each
@@ -222,12 +252,13 @@ impl PackageTree {
             .map(|(name, nodes)| {
                 let common_prefix = common_dir_prefix(nodes.iter().map(|n| n.path.as_path()));
                 let children = build_children(&nodes, &common_prefix, hidden);
+                let check = fold_check_states(children.iter().map(FolderChild::check_state));
                 PackageNode {
                     color_index: package_indices.get(&name).copied(),
                     name,
                     common_prefix,
                     children,
-                    check: CheckState::Checked,
+                    check,
                 }
             })
             .collect();
@@ -235,16 +266,18 @@ impl PackageTree {
         // Alphabetical externals by label. Externals typically have the
         // package name as their label (see `node_label::display_label`).
         externals.sort_by(|a, b| a.label.cmp(&b.label));
+        let external_leaves: Vec<ExternalLeaf> = externals
+            .into_iter()
+            .map(|n| ExternalLeaf {
+                id: n.id.clone(),
+                label: n.label.clone(),
+                check: check_from_hidden(&n.id, hidden),
+            })
+            .collect();
+        let externals_check = fold_check_states(external_leaves.iter().map(|e| e.check));
         let externals = ExternalsBucket {
-            externals: externals
-                .into_iter()
-                .map(|n| ExternalLeaf {
-                    id: n.id.clone(),
-                    label: n.label.clone(),
-                    check: check_from_hidden(&n.id, hidden),
-                })
-                .collect(),
-            check: CheckState::Checked,
+            externals: external_leaves,
+            check: externals_check,
         };
 
         // Flat list; keep alphabetical by display label. `display_label`
@@ -252,16 +285,18 @@ impl PackageTree {
         // `label` field — it's always the filename for `File` nodes, which
         // is stable enough for a deterministic order.
         unpackaged.sort_by(|a, b| a.label.cmp(&b.label));
+        let unpackaged_files: Vec<FileLeaf> = unpackaged
+            .into_iter()
+            .map(|n| FileLeaf {
+                id: n.id.clone(),
+                label: n.label.clone(),
+                check: check_from_hidden(&n.id, hidden),
+            })
+            .collect();
+        let unpackaged_check = fold_check_states(unpackaged_files.iter().map(|f| f.check));
         let unpackaged = UnpackagedBucket {
-            files: unpackaged
-                .into_iter()
-                .map(|n| FileLeaf {
-                    id: n.id.clone(),
-                    label: n.label.clone(),
-                    check: check_from_hidden(&n.id, hidden),
-                })
-                .collect(),
-            check: CheckState::Checked,
+            files: unpackaged_files,
+            check: unpackaged_check,
         };
 
         PackageTree {
@@ -277,6 +312,51 @@ impl PackageTree {
         self.packages.is_empty()
             && self.externals.externals.is_empty()
             && self.unpackaged.files.is_empty()
+    }
+}
+
+impl PackageNode {
+    /// Collect every descendant file leaf id under this package. Used by the
+    /// sidebar to cascade a package-level click down to the file-level
+    /// [`FilterState`] hide set.
+    pub fn collect_leaf_ids(&self, out: &mut Vec<NodeId>) {
+        for child in &self.children {
+            collect_folder_child_ids(child, out);
+        }
+    }
+}
+
+impl FolderNode {
+    /// Collect every descendant file leaf id under this folder.
+    pub fn collect_leaf_ids(&self, out: &mut Vec<NodeId>) {
+        for child in &self.children {
+            collect_folder_child_ids(child, out);
+        }
+    }
+}
+
+impl UnpackagedBucket {
+    /// Collect every file leaf id in this flat bucket.
+    pub fn collect_leaf_ids(&self, out: &mut Vec<NodeId>) {
+        out.extend(self.files.iter().map(|f| f.id.clone()));
+    }
+}
+
+impl ExternalsBucket {
+    /// Collect every external leaf id in this flat bucket. Externals live in
+    /// the same [`FilterState`] hide set as file leaves, so the cascade path
+    /// is identical.
+    pub fn collect_leaf_ids(&self, out: &mut Vec<NodeId>) {
+        out.extend(self.externals.iter().map(|e| e.id.clone()));
+    }
+}
+
+/// Recursive helper for collecting every file leaf id under a
+/// [`FolderChild`] subtree.
+fn collect_folder_child_ids(child: &FolderChild, out: &mut Vec<NodeId>) {
+    match child {
+        FolderChild::File(f) => out.push(f.id.clone()),
+        FolderChild::Folder(f) => f.collect_leaf_ids(out),
     }
 }
 
@@ -355,10 +435,11 @@ fn build_children(
         let mut out: Vec<FolderChild> = Vec::with_capacity(inter.folders.len() + inter.files.len());
         for (name, child) in inter.folders {
             let children = flatten(child);
+            let check = fold_check_states(children.iter().map(FolderChild::check_state));
             out.push(FolderChild::Folder(FolderNode {
                 name,
                 children,
-                check: CheckState::Checked,
+                check,
             }));
         }
         for (_, f) in inter.files {
@@ -758,8 +839,9 @@ mod tests {
     fn hidden_file_leaves_render_unchecked() {
         // A file id that's in the hide set must surface as Unchecked at the
         // leaf level; siblings outside the hide set keep their Checked
-        // state. Parent rows stay Checked in this slice — tristate/cascade
-        // for packages and folders lands in #23.
+        // state. Per #23 parent rows now fold their descendants: alpha has
+        // one hidden + two visible leaves (Mixed); utils has its single
+        // leaf hidden (Unchecked).
         let (g, idx) = build_fixture();
         let mut hidden: HashSet<NodeId> = HashSet::new();
         hidden.insert("packages/alpha/src/a.ts".to_string());
@@ -796,9 +878,13 @@ mod tests {
         };
         assert_eq!(helper.check, CheckState::Unchecked);
 
-        // Parents stay Checked pending #23.
-        assert_eq!(alpha.check, CheckState::Checked);
-        assert_eq!(utils.check, CheckState::Checked);
+        // Parent rollup: alpha mixes hidden `a.ts` with visible siblings;
+        // `utils` has only its single hidden leaf, so it folds to Unchecked.
+        assert_eq!(alpha.check, CheckState::Mixed);
+        assert_eq!(utils.check, CheckState::Unchecked);
+        // gamma transitively inherits the Mixed state (entry.ts visible,
+        // utils subtree Unchecked).
+        assert_eq!(gamma.check, CheckState::Mixed);
     }
 
     #[test]
@@ -812,5 +898,366 @@ mod tests {
         // Empty input yields an empty prefix rather than panicking.
         let empty: Vec<&Path> = Vec::new();
         assert_eq!(common_dir_prefix(empty), PathBuf::new());
+    }
+
+    // --- #23: tristate rollup + cascade helpers ---------------------------
+
+    #[test]
+    fn fold_check_states_basic_cases() {
+        use CheckState::*;
+        // Empty rolls up as the vacuous "fully on" — matches a freshly loaded
+        // bucket with no leaves.
+        assert_eq!(fold_check_states([] as [CheckState; 0]), Checked);
+        // Uniformly checked / unchecked pass through.
+        assert_eq!(fold_check_states([Checked, Checked]), Checked);
+        assert_eq!(fold_check_states([Unchecked, Unchecked]), Unchecked);
+        // Any mix — including a pre-existing Mixed descendant — yields Mixed.
+        assert_eq!(fold_check_states([Checked, Unchecked]), Mixed);
+        assert_eq!(fold_check_states([Checked, Mixed]), Mixed);
+        assert_eq!(fold_check_states([Unchecked, Mixed]), Mixed);
+    }
+
+    #[test]
+    fn parent_rolls_up_to_mixed_when_children_partially_checked() {
+        // alpha/src has three files; hide exactly one. The package row must
+        // render Mixed and the containing package transitively inherits it.
+        let (g, idx) = build_fixture();
+        let mut hidden: HashSet<NodeId> = HashSet::new();
+        hidden.insert("packages/alpha/src/b.ts".to_string());
+        let tree = PackageTree::build(&g, &idx, &hidden);
+
+        let alpha = tree
+            .packages
+            .iter()
+            .find(|p| p.name == "alpha")
+            .expect("alpha present");
+        assert_eq!(alpha.check, CheckState::Mixed);
+    }
+
+    #[test]
+    fn parent_rolls_up_to_unchecked_when_every_descendant_hidden() {
+        // Hide every leaf under alpha — package and every descendant folder
+        // must fold to Unchecked.
+        let (g, idx) = build_fixture();
+        let mut hidden: HashSet<NodeId> = HashSet::new();
+        for id in [
+            "packages/alpha/src/a.ts",
+            "packages/alpha/src/b.ts",
+            "packages/alpha/src/deep/c.ts",
+        ] {
+            hidden.insert(id.to_string());
+        }
+        let tree = PackageTree::build(&g, &idx, &hidden);
+
+        let alpha = tree
+            .packages
+            .iter()
+            .find(|p| p.name == "alpha")
+            .expect("alpha present");
+        assert_eq!(alpha.check, CheckState::Unchecked);
+        let deep = alpha
+            .children
+            .iter()
+            .find_map(|c| match c {
+                FolderChild::Folder(f) if f.name == "deep" => Some(f),
+                _ => None,
+            })
+            .expect("deep folder present");
+        assert_eq!(deep.check, CheckState::Unchecked);
+    }
+
+    #[test]
+    fn package_collect_leaf_ids_enumerates_every_descendant() {
+        // Cascade click needs every file id under a subtree. For alpha that's
+        // a.ts, b.ts, and deep/c.ts — no WorkspacePackage aggregators, no
+        // unrelated packages.
+        let (g, idx) = build_fixture();
+        let tree = PackageTree::build(&g, &idx, &HashSet::new());
+        let alpha = tree
+            .packages
+            .iter()
+            .find(|p| p.name == "alpha")
+            .expect("alpha present");
+        let mut ids: Vec<NodeId> = Vec::new();
+        alpha.collect_leaf_ids(&mut ids);
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "packages/alpha/src/a.ts".to_string(),
+                "packages/alpha/src/b.ts".to_string(),
+                "packages/alpha/src/deep/c.ts".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn folder_collect_leaf_ids_enumerates_every_descendant_transitively() {
+        // A nested folder's descendant list must reach through arbitrary
+        // depth — alpha's children surface `deep/` as a folder; that folder
+        // owns `c.ts`.
+        let (g, idx) = build_fixture();
+        let tree = PackageTree::build(&g, &idx, &HashSet::new());
+        let alpha = tree
+            .packages
+            .iter()
+            .find(|p| p.name == "alpha")
+            .expect("alpha present");
+        let deep = alpha
+            .children
+            .iter()
+            .find_map(|c| match c {
+                FolderChild::Folder(f) if f.name == "deep" => Some(f),
+                _ => None,
+            })
+            .expect("deep folder present");
+        let mut ids: Vec<NodeId> = Vec::new();
+        deep.collect_leaf_ids(&mut ids);
+        assert_eq!(ids, vec!["packages/alpha/src/deep/c.ts".to_string()]);
+    }
+
+    #[test]
+    fn unpackaged_and_externals_buckets_collect_their_leaves() {
+        // Bucket cascade walks each bucket's flat leaf list; helpers return
+        // every id regardless of the current filter state so callers can
+        // always toggle the whole bucket on/off uniformly.
+        let (g, idx) = build_fixture();
+        let tree = PackageTree::build(&g, &idx, &HashSet::new());
+
+        let mut unpk_ids: Vec<NodeId> = Vec::new();
+        tree.unpackaged.collect_leaf_ids(&mut unpk_ids);
+        unpk_ids.sort();
+        assert_eq!(
+            unpk_ids,
+            vec!["README.ts".to_string(), "tools/scratch.ts".to_string()]
+        );
+
+        let mut ext_ids: Vec<NodeId> = Vec::new();
+        tree.externals.collect_leaf_ids(&mut ext_ids);
+        ext_ids.sort();
+        assert_eq!(
+            ext_ids,
+            vec![
+                "external:@org/utils".to_string(),
+                "external:lodash".to_string(),
+                "external:react".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn externals_bucket_folds_to_unchecked_when_all_hidden() {
+        // Bucket-level checkbox must follow its leaves just like packages
+        // and folders do — all three externals hidden → bucket Unchecked.
+        let (g, idx) = build_fixture();
+        let mut hidden: HashSet<NodeId> = HashSet::new();
+        for name in ["react", "lodash", "@org/utils"] {
+            hidden.insert(format!("external:{name}"));
+        }
+        let tree = PackageTree::build(&g, &idx, &hidden);
+        assert_eq!(tree.externals.check, CheckState::Unchecked);
+    }
+
+    #[test]
+    fn externals_bucket_folds_to_mixed_when_some_hidden() {
+        let (g, idx) = build_fixture();
+        let mut hidden: HashSet<NodeId> = HashSet::new();
+        hidden.insert("external:lodash".to_string());
+        let tree = PackageTree::build(&g, &idx, &hidden);
+        assert_eq!(tree.externals.check, CheckState::Mixed);
+    }
+}
+
+// --- #23: in-memory cascade-semantics tests ------------------------------
+//
+// The sidebar owns the cascade *click* path (it has the checkbox widget); the
+// actual hide-set flip lives on `FilterState`. We simulate the cascade here
+// so tests cover the semantics — "checked → unhide all, unchecked/mixed →
+// hide all" — without standing up an egui context. Kept in a separate module
+// so the pure-tree tests above don't need `FilterState` in scope.
+#[cfg(test)]
+mod cascade_tests {
+    use super::*;
+    use crate::filter_state::FilterState;
+    use crate::graph::{Graph, Node, NodeKind};
+    use std::collections::{HashMap, HashSet};
+    use std::path::PathBuf;
+
+    fn file(id: &str, path: &str, package: Option<&str>) -> Node {
+        Node {
+            id: id.to_string(),
+            path: PathBuf::from(path),
+            label: PathBuf::from(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| id.to_string()),
+            package: package.map(str::to_string),
+            kind: NodeKind::File,
+        }
+    }
+
+    fn fixture() -> (Graph, HashMap<String, usize>) {
+        let mut g = Graph::new();
+        g.add_node(file(
+            "packages/alpha/src/a.ts",
+            "/repo/packages/alpha/src/a.ts",
+            Some("alpha"),
+        ));
+        g.add_node(file(
+            "packages/alpha/src/b.ts",
+            "/repo/packages/alpha/src/b.ts",
+            Some("alpha"),
+        ));
+        g.add_node(file(
+            "packages/alpha/src/deep/c.ts",
+            "/repo/packages/alpha/src/deep/c.ts",
+            Some("alpha"),
+        ));
+        let mut idx = HashMap::new();
+        idx.insert("alpha".to_string(), 0);
+        (g, idx)
+    }
+
+    /// Mirrors the sidebar's cascade rule: `Checked` → hide every id in
+    /// `leaf_ids`, any other state → show every id. Returns the toggles the
+    /// filter would have applied (i.e. ids whose state actually flipped),
+    /// mostly so tests can assert "the filter state changed in the expected
+    /// direction" without reaching into HashSet internals.
+    fn cascade(filter: &mut FilterState, parent: CheckState, leaf_ids: &[NodeId]) {
+        match parent {
+            CheckState::Checked => {
+                for id in leaf_ids {
+                    filter.hide(id);
+                }
+            }
+            CheckState::Unchecked | CheckState::Mixed => {
+                for id in leaf_ids {
+                    filter.show(id);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clicking_fully_checked_parent_unchecks_every_descendant() {
+        let (g, idx) = fixture();
+        let mut filter = FilterState::new();
+        let tree = PackageTree::build(&g, &idx, filter.hidden());
+        let alpha = &tree.packages[0];
+        assert_eq!(alpha.check, CheckState::Checked, "precondition");
+
+        let mut ids: Vec<NodeId> = Vec::new();
+        alpha.collect_leaf_ids(&mut ids);
+        cascade(&mut filter, alpha.check, &ids);
+
+        // Every descendant leaf is now in the hide set.
+        for id in &ids {
+            assert!(filter.is_hidden(id), "expected {id} hidden after cascade");
+        }
+        // Re-derive and confirm the package now folds to Unchecked.
+        let tree = PackageTree::build(&g, &idx, filter.hidden());
+        assert_eq!(tree.packages[0].check, CheckState::Unchecked);
+    }
+
+    #[test]
+    fn clicking_unchecked_parent_checks_every_descendant() {
+        let (g, idx) = fixture();
+        let mut filter = FilterState::new();
+        // Seed an all-hidden starting state.
+        for id in [
+            "packages/alpha/src/a.ts",
+            "packages/alpha/src/b.ts",
+            "packages/alpha/src/deep/c.ts",
+        ] {
+            filter.hide(&id.to_string());
+        }
+        let tree = PackageTree::build(&g, &idx, filter.hidden());
+        let alpha = &tree.packages[0];
+        assert_eq!(alpha.check, CheckState::Unchecked, "precondition");
+
+        let mut ids: Vec<NodeId> = Vec::new();
+        alpha.collect_leaf_ids(&mut ids);
+        cascade(&mut filter, alpha.check, &ids);
+
+        for id in &ids {
+            assert!(!filter.is_hidden(id), "expected {id} visible after cascade");
+        }
+        let tree = PackageTree::build(&g, &idx, filter.hidden());
+        assert_eq!(tree.packages[0].check, CheckState::Checked);
+    }
+
+    #[test]
+    fn clicking_mixed_parent_checks_every_descendant() {
+        // Mixed-parent click flips the subtree fully on, matching the
+        // acceptance criterion "unchecked OR mixed → check all descendants".
+        let (g, idx) = fixture();
+        let mut filter = FilterState::new();
+        filter.hide(&"packages/alpha/src/a.ts".to_string());
+        let tree = PackageTree::build(&g, &idx, filter.hidden());
+        let alpha = &tree.packages[0];
+        assert_eq!(alpha.check, CheckState::Mixed, "precondition");
+
+        let mut ids: Vec<NodeId> = Vec::new();
+        alpha.collect_leaf_ids(&mut ids);
+        cascade(&mut filter, alpha.check, &ids);
+
+        for id in &ids {
+            assert!(!filter.is_hidden(id));
+        }
+        let tree = PackageTree::build(&g, &idx, filter.hidden());
+        assert_eq!(tree.packages[0].check, CheckState::Checked);
+    }
+
+    #[test]
+    fn cascade_is_transitive_through_nested_folders() {
+        // Click the package row: every deep descendant — including ones
+        // buried under `deep/` — must land in the hide set.
+        let (g, idx) = fixture();
+        let mut filter = FilterState::new();
+        let tree = PackageTree::build(&g, &idx, filter.hidden());
+        let alpha = &tree.packages[0];
+        let mut ids: Vec<NodeId> = Vec::new();
+        alpha.collect_leaf_ids(&mut ids);
+        cascade(&mut filter, alpha.check, &ids);
+        assert!(filter.is_hidden("packages/alpha/src/deep/c.ts"));
+    }
+
+    #[test]
+    fn cascade_off_then_on_returns_to_initial_state() {
+        // Acceptance criterion: toggle a subtree off then on → same state
+        // as before. Start from a fully-visible subtree, drive one click
+        // cycle (Checked → hide all, Unchecked → show all), and confirm the
+        // hide set (and therefore the package's CheckState rollup) match
+        // the starting snapshot exactly.
+        let (g, idx) = fixture();
+        let mut filter = FilterState::new();
+        let initial: HashSet<NodeId> = filter.hidden().clone();
+
+        // Snapshot the subtree's leaves once — they're stable across the
+        // round-trip since we're not changing the graph.
+        let tree = PackageTree::build(&g, &idx, filter.hidden());
+        let alpha = &tree.packages[0];
+        let mut ids: Vec<NodeId> = Vec::new();
+        alpha.collect_leaf_ids(&mut ids);
+
+        // First click: fully-checked parent → cascade hides every leaf.
+        let tree = PackageTree::build(&g, &idx, filter.hidden());
+        cascade(&mut filter, tree.packages[0].check, &ids);
+        let tree = PackageTree::build(&g, &idx, filter.hidden());
+        assert_eq!(
+            tree.packages[0].check,
+            CheckState::Unchecked,
+            "mid-cycle: subtree fully off"
+        );
+
+        // Second click: unchecked parent → cascade shows every leaf.
+        cascade(&mut filter, tree.packages[0].check, &ids);
+        assert_eq!(
+            filter.hidden(),
+            &initial,
+            "idempotency: subtree cascade round-trips to the original filter state"
+        );
+        let tree = PackageTree::build(&g, &idx, filter.hidden());
+        assert_eq!(tree.packages[0].check, CheckState::Checked);
     }
 }
