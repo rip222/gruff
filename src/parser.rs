@@ -83,14 +83,22 @@ fn parse_imports_detailed(src: &str, ext: &str) -> Result<Vec<ImportStatement>, 
         _ => (false, false),
     };
 
+    // `decorators: true` is required to parse Angular components (`@Component({...})`),
+    // NestJS controllers, MobX/TypeORM annotations, etc. Without it SWC rejects
+    // the file outright and we extract zero imports — so every consumer of an
+    // Angular UI library loses its edges. Enabling the flag is safe: decorators
+    // don't conflict with the import forms we care about.
     let syntax = if is_ts {
         Syntax::Typescript(TsSyntax {
             tsx: is_jsx,
+            decorators: true,
             ..Default::default()
         })
     } else {
         Syntax::Es(EsSyntax {
             jsx: is_jsx,
+            decorators: true,
+            decorators_before_export: true,
             ..Default::default()
         })
     };
@@ -541,6 +549,50 @@ mod tests {
         assert!(pairs.contains(&("./b", ImportKind::ReExport)));
         assert!(pairs.contains(&("./c", ImportKind::Require)));
         assert!(pairs.contains(&("./d", ImportKind::Dynamic)));
+    }
+
+    #[test]
+    fn extracts_imports_from_file_with_angular_decorator() {
+        // The whole reason we turn on `decorators` in TsSyntax. Without it SWC
+        // rejects `@Component({...})` outright, we return zero imports, and
+        // every Angular component loses every edge it should have.
+        let src = r#"
+            import { Component, input } from '@angular/core';
+            import { Slider } from '@tvd/design-system/slider';
+
+            @Component({
+                selector: 'tvd-time-range',
+                imports: [Slider],
+                template: `<tvd-slider />`,
+            })
+            export class TimeRange {
+                min = input(0);
+            }
+        "#;
+        let imps = parse_imports(src, "ts");
+        assert!(
+            sources(&imps).contains(&"@tvd/design-system/slider"),
+            "decorators must not block import extraction; got {imps:?}"
+        );
+    }
+
+    #[test]
+    fn extracts_imports_from_file_with_method_decorator() {
+        // NestJS/legacy-style class method decorators. Same failure mode as
+        // the class-level test — catches a regression where the flag is on
+        // for top-level decorators but off for method-level ones.
+        let src = r#"
+            import { Injectable } from '@nestjs/common';
+            import { Repository } from './repo';
+
+            @Injectable()
+            export class UserService {
+                constructor(@Inject('REPO') private repo: Repository) {}
+            }
+        "#;
+        let imps = parse_imports(src, "ts");
+        assert!(sources(&imps).contains(&"./repo"), "got {imps:?}");
+        assert!(sources(&imps).contains(&"@nestjs/common"));
     }
 
     #[test]

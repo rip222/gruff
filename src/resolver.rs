@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -240,18 +240,34 @@ pub fn resolve_relative(from_file: &Path, import_source: &str) -> Option<PathBuf
 ///
 /// Strips `//` and `/* */` comments first because `tsconfig.json` is JSONC,
 /// not strict JSON — Node's TypeScript tooling permits both.
+///
+/// Follows `extends` so child configs inherit `paths` + `baseUrl` from their
+/// parent chain. This matches the Nx/Angular convention of declaring every
+/// path alias once at the root and having nested `tsconfig.json` files just
+/// `extends` it — otherwise every alias import in such repos would resolve
+/// as an external package.
 pub fn parse_tsconfig(path: &Path) -> Option<Tsconfig> {
+    parse_tsconfig_inner(path, &mut HashSet::new())
+}
+
+fn parse_tsconfig_inner(path: &Path, visited: &mut HashSet<PathBuf>) -> Option<Tsconfig> {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if !visited.insert(canonical) {
+        // Cycle in the `extends` chain — give up rather than loop forever.
+        return None;
+    }
     let src = fs::read_to_string(path).ok()?;
     let cleaned = strip_jsonc_comments(&src);
     let v: Value = serde_json::from_str(&cleaned).ok()?;
     let dir = path.parent()?.to_path_buf();
     let co = v.get("compilerOptions");
-    let base_url = co
+
+    let own_base_url = co
         .and_then(|c| c.get("baseUrl"))
         .and_then(|x| x.as_str())
-        .map(|s| dir.join(s))
-        .unwrap_or_else(|| dir.clone());
-    let mut paths = Vec::new();
+        .map(|s| dir.join(s));
+
+    let mut own_paths: Vec<(String, Vec<String>)> = Vec::new();
     if let Some(obj) = co.and_then(|c| c.get("paths")).and_then(|p| p.as_object()) {
         for (pattern, value) in obj {
             if let Some(arr) = value.as_array() {
@@ -259,18 +275,97 @@ pub fn parse_tsconfig(path: &Path) -> Option<Tsconfig> {
                     .iter()
                     .filter_map(|x| x.as_str().map(String::from))
                     .collect();
-                paths.push((pattern.clone(), subs));
+                own_paths.push((pattern.clone(), subs));
             }
         }
         // Longest patterns first so `@org/shared/utils` beats `@org/shared/*`
         // when both could match.
-        paths.sort_by_key(|(p, _)| std::cmp::Reverse(p.len()));
+        own_paths.sort_by_key(|(p, _)| std::cmp::Reverse(p.len()));
     }
+
+    // If this config is missing `paths` or `baseUrl`, resolve the `extends`
+    // chain and inherit the missing field. TypeScript's rule: `paths` is a
+    // whole-value override (no merge), and `baseUrl` inherits independently
+    // from whichever ancestor declared it. Inheriting `paths` also drags the
+    // parent's `baseUrl` along — that's the `baseUrl` the substitutions are
+    // resolved against.
+    let (paths, base_url) = if own_paths.is_empty() || own_base_url.is_none() {
+        let parent = v
+            .get("extends")
+            .and_then(|x| x.as_str())
+            .and_then(|e| resolve_extends_path(&dir, e))
+            .and_then(|p| parse_tsconfig_inner(&p, visited));
+        match parent {
+            Some(parent) => {
+                let paths = if own_paths.is_empty() {
+                    parent.paths
+                } else {
+                    own_paths
+                };
+                let base_url = own_base_url.unwrap_or(parent.base_url);
+                (paths, base_url)
+            }
+            None => (own_paths, own_base_url.unwrap_or_else(|| dir.clone())),
+        }
+    } else {
+        (own_paths, own_base_url.unwrap_or_else(|| dir.clone()))
+    };
+
     Some(Tsconfig {
         dir,
         base_url,
         paths,
     })
+}
+
+/// Resolve the `extends` field of a tsconfig to a filesystem path. Handles
+/// the two shapes that matter in practice: a relative path (`"../../tsconfig.json"`,
+/// with or without the `.json` suffix) and a bare path inside `node_modules`
+/// (`"@tsconfig/node20/tsconfig.json"`). Node-module extends are best-effort:
+/// we walk up from `from_dir` looking for a `node_modules` that contains the
+/// specifier, and bail out otherwise.
+fn resolve_extends_path(from_dir: &Path, extends: &str) -> Option<PathBuf> {
+    if is_relative_specifier(extends) || extends.starts_with('/') {
+        let direct = from_dir.join(extends);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        let with_json = append_ext(&direct, "json");
+        if with_json.is_file() {
+            return Some(with_json);
+        }
+        if direct.is_dir() {
+            let fallback = direct.join("tsconfig.json");
+            if fallback.is_file() {
+                return Some(fallback);
+            }
+        }
+        return None;
+    }
+
+    // Bare specifier: walk up looking for a `node_modules/<specifier>` that
+    // exists on disk. Supports `pkg/path/to/tsconfig.json` and `pkg` (in
+    // which case we try `pkg/tsconfig.json` and the package manifest's
+    // `tsconfig` field — the latter is rare enough that we skip it).
+    let mut current = Some(from_dir.to_path_buf());
+    while let Some(dir) = current {
+        let candidate = dir.join("node_modules").join(extends);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        let with_json = append_ext(&candidate, "json");
+        if with_json.is_file() {
+            return Some(with_json);
+        }
+        if candidate.is_dir() {
+            let fallback = candidate.join("tsconfig.json");
+            if fallback.is_file() {
+                return Some(fallback);
+            }
+        }
+        current = dir.parent().map(|p| p.to_path_buf());
+    }
+    None
 }
 
 /// Strip line and block comments from a JSONC string so `serde_json` can
@@ -852,6 +947,157 @@ mod tests {
         assert!(!parsed.paths.is_empty());
         assert_eq!(parsed.paths[0].0, "@org/shared/*");
         assert_eq!(parsed.paths[0].1, vec!["packages/shared/src/*".to_string()]);
+    }
+
+    #[test]
+    fn tsconfig_inherits_paths_from_extends() {
+        // Nx/Angular shape: every nested tsconfig just `extends` the root,
+        // which is where the `paths` live. Without following `extends` the
+        // resolver finds the nearest (empty) tsconfig and gives up, and every
+        // workspace alias gets misclassified as an external package.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "tsconfig.json",
+            r#"{
+                "compilerOptions": {
+                    "baseUrl": ".",
+                    "paths": { "@org/shared/*": ["libs/shared/*"] }
+                }
+            }"#,
+        );
+        let nested = write(
+            dir.path(),
+            "libs/ui/tsconfig.json",
+            r#"{
+                "extends": "../../tsconfig.json",
+                "compilerOptions": { "outDir": "../../out-tsc/libs/ui" }
+            }"#,
+        );
+        let parsed = parse_tsconfig(&nested).expect("parse");
+        assert_eq!(parsed.paths.len(), 1);
+        assert_eq!(parsed.paths[0].0, "@org/shared/*");
+        assert_eq!(parsed.paths[0].1, vec!["libs/shared/*".to_string()]);
+        // baseUrl inherits together with paths so substitutions resolve
+        // against the ancestor that declared them, not the child's dir.
+        let expected_base = dir.path().canonicalize().unwrap_or_else(|_| dir.path().to_path_buf());
+        let got_base = parsed
+            .base_url
+            .canonicalize()
+            .unwrap_or_else(|_| parsed.base_url.clone());
+        assert_eq!(got_base, expected_base);
+    }
+
+    #[test]
+    fn tsconfig_extends_supports_omitted_json_suffix() {
+        // TypeScript accepts `"extends": "../tsconfig.base"` (no `.json`).
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "tsconfig.base.json",
+            r#"{
+                "compilerOptions": {
+                    "baseUrl": ".",
+                    "paths": { "@x/*": ["packages/*"] }
+                }
+            }"#,
+        );
+        let nested = write(
+            dir.path(),
+            "apps/web/tsconfig.json",
+            r#"{ "extends": "../../tsconfig.base" }"#,
+        );
+        let parsed = parse_tsconfig(&nested).expect("parse");
+        assert_eq!(parsed.paths.len(), 1);
+    }
+
+    #[test]
+    fn tsconfig_child_paths_override_extends() {
+        // When the child declares its own `paths`, the parent's are NOT
+        // merged — child is a whole-value override. Matches TS semantics.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "tsconfig.json",
+            r#"{
+                "compilerOptions": {
+                    "baseUrl": ".",
+                    "paths": { "@root/*": ["packages/*"] }
+                }
+            }"#,
+        );
+        let nested = write(
+            dir.path(),
+            "libs/a/tsconfig.json",
+            r#"{
+                "extends": "../../tsconfig.json",
+                "compilerOptions": {
+                    "baseUrl": ".",
+                    "paths": { "@child/*": ["src/*"] }
+                }
+            }"#,
+        );
+        let parsed = parse_tsconfig(&nested).expect("parse");
+        assert_eq!(parsed.paths.len(), 1);
+        assert_eq!(parsed.paths[0].0, "@child/*");
+    }
+
+    #[test]
+    fn tsconfig_extends_cycle_does_not_loop() {
+        // Pathological but cheap to guard against: a → b → a.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "a/tsconfig.json",
+            r#"{ "extends": "../b/tsconfig.json" }"#,
+        );
+        write(
+            dir.path(),
+            "b/tsconfig.json",
+            r#"{ "extends": "../a/tsconfig.json" }"#,
+        );
+        let parsed = parse_tsconfig(&dir.path().join("a/tsconfig.json")).expect("parse");
+        assert!(parsed.paths.is_empty());
+    }
+
+    #[test]
+    fn resolves_tsconfig_paths_alias_through_extends_chain() {
+        // End-to-end: nested tsconfig extends the root, importer sits under
+        // the nested tsconfig. Without the extends fix this import would fall
+        // through to `bare_specifier_package` and become an external edge.
+        let dir = tempdir().unwrap();
+        write(dir.path(), "package.json", r#"{"name":"root"}"#);
+        write(
+            dir.path(),
+            "tsconfig.json",
+            r#"{
+                "compilerOptions": {
+                    "baseUrl": ".",
+                    "paths": { "@tvd/design-system/*": ["libs/design-system/*"] }
+                }
+            }"#,
+        );
+        write(
+            dir.path(),
+            "libs/ui/tsconfig.json",
+            r#"{
+                "extends": "../../tsconfig.json",
+                "compilerOptions": { "outDir": "../../out-tsc/libs/ui" }
+            }"#,
+        );
+        let target = write(dir.path(), "libs/design-system/slider/index.ts", "");
+        let from = write(dir.path(), "libs/ui/time-range/time-range.ts", "");
+
+        let ws = ws_with(dir.path());
+        let ctx = ResolverContext::build(&ws);
+        let imp = ImportStatement::literal("@tvd/design-system/slider", ImportKind::Static);
+        let results = resolve_import(&ctx, &ws, &from, &imp);
+        assert_eq!(
+            results,
+            vec![ResolvedImport::WorkspaceFile(
+                target.canonicalize().unwrap_or(target)
+            )]
+        );
     }
 
     #[test]
