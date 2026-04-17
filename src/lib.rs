@@ -5,6 +5,7 @@ pub mod cli;
 pub mod colors;
 pub mod config;
 pub mod editor;
+pub mod entry_points;
 pub mod error;
 pub mod export;
 pub mod filter_state;

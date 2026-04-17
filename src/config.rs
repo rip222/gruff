@@ -29,6 +29,13 @@ pub struct Config {
     /// `#[serde(default)]` on both this field and `RecentList::paths`.
     #[serde(default)]
     pub recent: RecentList,
+    /// Optional glob list the user can populate in `config.toml` to mark
+    /// additional files as entry points for the dead-code detector (#36).
+    /// Patterns are matched against workspace-relative paths; an empty list
+    /// means "rely only on auto-discovered entry points." `#[serde(default)]`
+    /// keeps the field absent-able — older configs load without this key.
+    #[serde(default)]
+    pub entry_points: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -135,6 +142,7 @@ mod tests {
             watch: WatchConfig { debounce_ms: 250 },
             last_repo: None,
             recent: RecentList::default(),
+            entry_points: Vec::new(),
         };
         save_to(&path, &cfg).unwrap();
         let reloaded = load_from(&path);
