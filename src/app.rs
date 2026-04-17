@@ -17,6 +17,7 @@ use crate::layout::Layout;
 use crate::lib_detect::{self, LibDetector, TsLibDetector};
 use crate::shortcuts::{self, KeyPress, ShortcutAction, ShortcutMods};
 use crate::watcher::{ChangeEvent, Watcher};
+use crate::workspace_state::{self, WorkspaceState};
 
 mod canvas;
 mod editor_prompt;
@@ -288,13 +289,20 @@ impl GruffApp {
         // means the user won't get auto-reopen or an updated MRU; don't
         // surface it.
         self.config.last_repo = Some(root.clone());
-        self.config.recent.push(root);
+        self.config.recent.push(root.clone());
         let _ = config::save(&self.config);
 
-        // Filter state is session-scoped: opening a new folder starts fresh
-        // with every node visible. Must run *before* `rebuild_derived_indexes`
-        // so cycles are computed against the full (unfiltered) new graph.
-        self.filter_state.clear();
+        // Load any previously-persisted hide-set for this workspace, prune
+        // stale ids (files renamed / deleted since last launch, or a
+        // just-flipped barrel toggle that reshapes the id space), install
+        // the survivors, and wire the persist callback so mid-session
+        // curation is written back immediately. Previously this was just
+        // a `clear()` — PRD #34 replaces session-scoped filter state with
+        // per-workspace persistence.
+        let persisted = workspace_state::load(&root);
+        let (surviving, _dropped) = self.prune_hidden_to_current_graph(persisted.hidden);
+        self.filter_state.install_loaded(surviving);
+        self.install_filter_persist_callback(root.clone());
 
         self.rebuild_derived_indexes();
         self.frame_request = None;
@@ -649,6 +657,46 @@ impl GruffApp {
         // — exactly the "~200-300 ms" target from PRD #16's
         // "Camera fit-on-filter-change flow".
         self.fit_request = Some(FitMode::Tween);
+    }
+
+    /// Drop hide-ids that don't appear in the current graph and return the
+    /// survivors. Called at load-time after the graph is built so a
+    /// persisted hide-set that references a renamed / deleted / barrel-
+    /// reshaped id silently loses those entries rather than leaking ghost
+    /// "hidden" state into the sidebar.
+    ///
+    /// Returns `(surviving, dropped)` so callers can log the drop count if
+    /// they want to; the app ignores it today but the shape keeps the test
+    /// assertion cheap.
+    fn prune_hidden_to_current_graph(
+        &self,
+        hidden: std::collections::HashSet<NodeId>,
+    ) -> (std::collections::HashSet<NodeId>, Vec<NodeId>) {
+        let mut surviving = std::collections::HashSet::new();
+        let mut dropped = Vec::new();
+        for id in hidden {
+            if self.graph.nodes.contains_key(&id) {
+                surviving.insert(id);
+            } else {
+                dropped.push(id);
+            }
+        }
+        (surviving, dropped)
+    }
+
+    /// Install the per-workspace persist callback on `filter_state`. The
+    /// closure captures `root` by value (so it has a `'static` lifetime)
+    /// and pipes every hide-set change through [`workspace_state::save`].
+    /// A save failure is silently dropped — the worst case is the user's
+    /// curation doesn't survive a relaunch, which is strictly better than
+    /// panicking or surfacing a disk error on every checkbox click.
+    fn install_filter_persist_callback(&mut self, root: PathBuf) {
+        self.filter_state.set_persist_callback(move |hidden| {
+            let state = WorkspaceState {
+                hidden: hidden.clone(),
+            };
+            let _ = workspace_state::save(&root, &state);
+        });
     }
 
     /// Apply a batch of file-level visibility toggles produced by the
@@ -1782,6 +1830,132 @@ mod tests {
         assert_eq!(
             bar_to_util, 1,
             "expected the literal bar.ts -> src/util.ts edge when expanded"
+        );
+    }
+
+    // --- workspace filter persistence (#34) -------------------------------
+
+    /// Pick a concrete file node id from the current graph. The indexer's
+    /// id scheme uses the canonical file path as the id, so "any file node"
+    /// is the shape we can hide without having to hard-code the exact
+    /// formatting.
+    fn first_file_node_id(app: &GruffApp) -> NodeId {
+        app.graph
+            .nodes
+            .values()
+            .find(|n| matches!(n.kind, NodeKind::File))
+            .expect("test fixture must produce at least one file node")
+            .id
+            .clone()
+    }
+
+    #[test]
+    fn hidden_nodes_survive_folder_rebuild_against_same_root() {
+        // End-to-end PRD #34 guarantee: hide a node, drop the app
+        // instance, rebuild it against the same folder, and the hide
+        // must still be in effect. Without per-workspace persistence
+        // this would have regressed to "everything visible again" —
+        // exactly the problem the issue describes for monorepo users.
+        //
+        // `$HOME` is redirected at a per-test tempdir so the
+        // `~/.gruff/workspaces/` file we write doesn't touch the real
+        // user config. `HOME_GUARD` serialises against every other
+        // HOME-mutating test in the crate.
+        let _guard = HOME_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("a.ts"), r#"import { b } from "./b";"#).unwrap();
+        std::fs::write(repo.path().join("b.ts"), "export const b = 1;").unwrap();
+
+        // First app: hide one node. The persist callback writes the
+        // hide-set to `~/.gruff/workspaces/<hash>.toml` synchronously.
+        let hidden_id = {
+            let mut app = GruffApp::with_path(repo.path().to_path_buf());
+            let id = first_file_node_id(&app);
+            app.toggle_file_visibility(&[id.clone()]);
+            assert!(
+                app.filter_state.is_hidden(&id),
+                "precondition: node is hidden before drop",
+            );
+            id
+        };
+
+        // Second app against the same root: the hide must come back.
+        let app = GruffApp::with_path(repo.path().to_path_buf());
+        assert!(
+            app.filter_state.is_hidden(&hidden_id),
+            "hide-set must survive across app rebuild for the same workspace",
+        );
+    }
+
+    #[test]
+    fn stale_hidden_ids_are_pruned_on_load() {
+        // PRD #34 decision: hide-ids that don't resolve to any current
+        // `NodeId` are silently dropped on load. Seed the workspace
+        // file with a bogus id alongside a real one, rebuild, and
+        // assert only the real one survives. This covers the rename /
+        // delete / barrel-reshape cases where the id space drifted
+        // between runs.
+        let _guard = HOME_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("a.ts"), r#"import { b } from "./b";"#).unwrap();
+        std::fs::write(repo.path().join("b.ts"), "export const b = 1;").unwrap();
+
+        // Build once to discover canonical root + a real node id we can
+        // keep in the hide-set. Then hand-write the workspace file with
+        // a ghost id tacked on.
+        let (canonical_root, real_id) = {
+            let app = GruffApp::with_path(repo.path().to_path_buf());
+            (app.last_root.clone().unwrap(), first_file_node_id(&app))
+        };
+
+        let mut hidden = std::collections::HashSet::new();
+        hidden.insert(real_id.clone());
+        hidden.insert("ghost-that-never-existed.ts".to_string());
+        workspace_state::save(&canonical_root, &WorkspaceState { hidden }).unwrap();
+
+        // Second app: the ghost must have been pruned, the real id
+        // must have survived.
+        let app = GruffApp::with_path(repo.path().to_path_buf());
+        assert!(
+            app.filter_state.is_hidden(&real_id),
+            "real id must still be hidden after load",
+        );
+        assert!(
+            !app.filter_state.is_hidden("ghost-that-never-existed.ts"),
+            "stale id must be silently pruned on load",
+        );
+    }
+
+    #[test]
+    fn fresh_workspace_starts_with_empty_hide_set() {
+        // No file on disk yet → `workspace_state::load` returns the
+        // default, which means nothing is hidden. Regression guard for
+        // "malformed or missing files fall back to default silently" —
+        // without this check a bug in the load path could leak a
+        // hidden-everything state into first-run users.
+        let _guard = HOME_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("a.ts"), "export const a = 1;").unwrap();
+
+        let app = GruffApp::with_path(repo.path().to_path_buf());
+        assert!(
+            app.filter_state.is_empty(),
+            "first load of a never-opened workspace must start with nothing hidden",
         );
     }
 }
