@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::recents::RecentList;
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Config {
     #[serde(default)]
@@ -21,6 +23,12 @@ pub struct Config {
     /// state are deliberately *not* persisted — each session starts fresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_repo: Option<PathBuf>,
+    /// MRU list of recently opened folders, surfaced by the
+    /// `File → Open Recent ▸` submenu. Stored under `[recent]` in
+    /// `config.toml`; an absent table deserializes to an empty list via the
+    /// `#[serde(default)]` on both this field and `RecentList::paths`.
+    #[serde(default)]
+    pub recent: RecentList,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -126,6 +134,7 @@ mod tests {
             },
             watch: WatchConfig { debounce_ms: 250 },
             last_repo: None,
+            recent: RecentList::default(),
         };
         save_to(&path, &cfg).unwrap();
         let reloaded = load_from(&path);
@@ -194,5 +203,70 @@ debounce_ms = 750
         let path = dir.path().join("config.toml");
         fs::write(&path, "this is not toml ]]]").unwrap();
         assert_eq!(load_from(&path), Config::default());
+    }
+
+    #[test]
+    fn missing_recent_table_loads_empty_list() {
+        // An older config.toml written before the `[recent]` table existed
+        // must still load without error — `#[serde(default)]` fills the
+        // field with an empty `RecentList`.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[editor]
+name = "code"
+
+[watch]
+debounce_ms = 500
+"#,
+        )
+        .unwrap();
+        let cfg = load_from(&path);
+        assert!(cfg.recent.is_empty(), "recent should default to empty");
+    }
+
+    #[test]
+    fn recent_round_trips_preserving_order_and_cap() {
+        // Save → load → save equality: order, content, and the cap all
+        // survive a TOML round-trip.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = Config::default();
+        // Push more than the cap to force eviction before saving.
+        for i in 0..7 {
+            cfg.recent.push(PathBuf::from(format!("/tmp/r{i}")));
+        }
+        assert_eq!(cfg.recent.len(), crate::recents::MAX_RECENTS);
+        save_to(&path, &cfg).unwrap();
+        let reloaded = load_from(&path);
+        assert_eq!(
+            reloaded, cfg,
+            "TOML round-trip must preserve recent list exactly"
+        );
+        // Sanity: top-of-list is the most-recent push.
+        let first: Vec<_> = reloaded.recent.iter_excluding(None).collect();
+        assert_eq!(first[0], PathBuf::from("/tmp/r6").as_path());
+    }
+
+    #[test]
+    fn malformed_recent_falls_back_silently() {
+        // A hand-edited file with a garbled `[recent]` value must fall back
+        // to the whole-config default rather than panic. Mirrors the
+        // existing "malformed → defaults" policy for other sections.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[recent]
+paths = "not-an-array-of-paths"
+"#,
+        )
+        .unwrap();
+        let cfg = load_from(&path);
+        assert_eq!(cfg, Config::default());
+        assert!(cfg.recent.is_empty());
     }
 }
