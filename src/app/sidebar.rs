@@ -30,6 +30,61 @@ impl GruffApp {
             ui.separator();
             self.draw_dead_code_pane(ui);
         }
+        // Hotspots pane (#37) — visibility is tied to the overlay toggle
+        // so the sidebar only shows the ranking while the canvas is also
+        // painting halos. Toggling the overlay off drops both together.
+        if self.hotspot_data.is_some() {
+            ui.add_space(12.0);
+            ui.separator();
+            self.draw_hotspots_pane(ui);
+        }
+    }
+
+    /// Ranked hotspot list (#37). Only rendered when `hotspot_data` is
+    /// `Some` — the pane's lifetime is tied to the overlay checkbox. Each
+    /// row shows the node id (monospace) and its normalised score rounded
+    /// to two decimals; clicking a row selects + frames the node, matching
+    /// the click-to-select affordance of the Cycles and Dead-code panes.
+    /// An empty ranking (zero-node graph after overlay-on) renders a
+    /// muted "none" placeholder so the pane's presence stays coherent.
+    fn draw_hotspots_pane(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        ui.heading("Hotspots");
+        ui.add_space(4.0);
+
+        // Snapshot the ranking to a local vec so we can call
+        // `select_and_frame_node` (which borrows `&mut self`) inside the
+        // render loop without holding a borrow on `self.hotspot_data`.
+        let Some(data) = self.hotspot_data.as_ref() else {
+            return;
+        };
+        if data.ranked.is_empty() {
+            ui.label(egui::RichText::new("none").italics().color(colors::HINT));
+            return;
+        }
+        let snapshot: Vec<(NodeId, f32)> = data
+            .ranked
+            .iter()
+            .map(|(id, raw)| (id.clone(), data.normalise(*raw)))
+            .collect();
+
+        egui::ScrollArea::vertical()
+            .id_salt("hotspots-list")
+            .max_height(260.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for (id, norm) in &snapshot {
+                    let file_name = file_name_of(id);
+                    let label = format!("{:.2}  ·  {}", norm, file_name);
+                    let resp = ui.add(
+                        egui::Button::new(egui::RichText::new(label).monospace().small())
+                            .min_size(egui::vec2(ui.available_width(), 0.0)),
+                    );
+                    if resp.clicked() {
+                        self.select_and_frame_node(id);
+                    }
+                }
+            });
     }
 
     /// Two-part dead-code report (#36). `Unreachable from entry` lists files
@@ -528,6 +583,19 @@ fn draw_color_swatch(ui: &mut egui::Ui, color_index: Option<usize>) {
         .unwrap_or(colors::HINT);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
     ui.painter().rect_filled(rect, 2.0, color);
+}
+
+/// Pull the trailing file name off a node id for the hotspots pane's row
+/// label. Node ids are typically workspace-relative paths; the full path
+/// is too wide for a sidebar row at typical widths, and the PRD asks for
+/// "file name + normalised score" per entry. Falls back to the full id when
+/// no `/` is present — synthetic ids (externals, workspace-package
+/// aggregators) aren't paths and read better unchanged.
+fn file_name_of(id: &NodeId) -> &str {
+    match id.rsplit_once('/') {
+        Some((_, tail)) if !tail.is_empty() => tail,
+        _ => id.as_str(),
+    }
 }
 
 fn render_list(ui: &mut egui::Ui, title: &str, items: &[NodeId]) {
