@@ -259,6 +259,75 @@ debounce_ms = 500
     }
 
     #[test]
+    fn entry_points_default_to_empty_list() {
+        // Absent `entry_points` key in the config loads as an empty vec, the
+        // same way every other opt-in list in this file behaves. Older
+        // configs written before the dead-code detector existed must keep
+        // loading without error.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[editor]
+name = "code"
+"#,
+        )
+        .unwrap();
+        let cfg = load_from(&path);
+        assert!(
+            cfg.entry_points.is_empty(),
+            "entry_points should default to empty list when the key is absent",
+        );
+    }
+
+    #[test]
+    fn populated_entry_points_round_trip() {
+        // Save → load → equality on a realistic glob list. Preserves order,
+        // content, and the fact that entries are plain strings (no URL
+        // escaping, no path normalisation, no surprise unification).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = Config {
+            entry_points: vec![
+                "scripts/**/*.ts".to_string(),
+                "tools/**/main.ts".to_string(),
+            ],
+            ..Config::default()
+        };
+        save_to(&path, &cfg).unwrap();
+        let reloaded = load_from(&path);
+        assert_eq!(cfg, reloaded);
+        assert_eq!(
+            reloaded.entry_points,
+            vec![
+                "scripts/**/*.ts".to_string(),
+                "tools/**/main.ts".to_string(),
+            ],
+            "round-trip must preserve both order and content",
+        );
+    }
+
+    #[test]
+    fn malformed_entry_points_falls_back_silently() {
+        // A hand-edited `entry_points` value of the wrong TOML type (e.g. a
+        // string instead of an array) must fall back to the whole-config
+        // default rather than panic — same policy as the other sections.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+entry_points = "not-an-array"
+"#,
+        )
+        .unwrap();
+        let cfg = load_from(&path);
+        assert_eq!(cfg, Config::default());
+        assert!(cfg.entry_points.is_empty());
+    }
+
+    #[test]
     fn malformed_recent_falls_back_silently() {
         // A hand-edited file with a garbled `[recent]` value must fall back
         // to the whole-config default rather than panic. Mirrors the
