@@ -185,6 +185,14 @@ pub struct GruffApp {
     /// static shortcuts registry. Toggled by the `?` keybind and the help
     /// button wired in commit 4 of PRD #33.
     show_help: bool,
+    /// When true, a node selection triggers the blast-radius dim pass:
+    /// every non-dependent is faded while the selected node and its
+    /// transitive upstream cone stay lit. `B` flips this without deselecting;
+    /// Escape deselects and implicitly clears the dim (via empty selection).
+    /// Default is `true` so a fresh click lights up the cone immediately —
+    /// "on by default when selecting" per PRD #35's decision doc. Deliberately
+    /// not persisted across sessions; a relaunch re-defaults to on.
+    blast_radius_active: bool,
 }
 
 impl Default for GruffApp {
@@ -219,6 +227,7 @@ impl Default for GruffApp {
             last_root: None,
             filter_state: FilterState::new(),
             show_help: false,
+            blast_radius_active: true,
         }
     }
 }
@@ -824,10 +833,20 @@ impl GruffApp {
                 // round-trips the search overlay.
                 self.show_help = !self.show_help;
             }
+            ShortcutAction::ToggleBlastRadius => {
+                // Flip the dim without touching selection. Selection stays
+                // where it is so the user can toggle the cone off to read
+                // the surrounding structure and toggle it back on to
+                // re-focus, all without losing context. The dim is only
+                // observable when there's a selection, but we flip the flag
+                // unconditionally — a press while nothing is selected
+                // changes the default the next selection will land on.
+                self.blast_radius_active = !self.blast_radius_active;
+            }
             ShortcutAction::Noop => {
-                // Placeholder entry (`B` pending issue #35). Fall through
-                // intentionally — the registry keeps the row for
-                // documentation, but no app-side side effect fires.
+                // Placeholder entry kept for display-only registry rows
+                // (e.g. the "Sidebar click" Filters documentation entry).
+                // Fall through intentionally — no app-side side effect.
             }
         }
     }
@@ -1785,14 +1804,94 @@ mod tests {
 
     #[test]
     fn noop_action_leaves_state_untouched() {
-        // The remaining `Noop` variant (the `B` placeholder for issue #35,
-        // and the sidebar-click documentation row) must not mutate state
-        // when dispatched — future placeholder additions must stay silent.
+        // The `Noop` variant (today reserved for the display-only
+        // "Sidebar click" Filters row) must not mutate state when
+        // dispatched — any future placeholder additions must stay silent.
         let mut app = app_with_graph(abc_cycle_graph());
         let before = (app.sim_enabled, app.selected.clone(), app.fit_request);
         app.dispatch_shortcut(ShortcutAction::Noop);
         let after = (app.sim_enabled, app.selected.clone(), app.fit_request);
         assert_eq!(before, after, "Noop action must not mutate app state");
+    }
+
+    // --- blast-radius (B) keybind (#35) -----------------------------------
+
+    #[test]
+    fn b_keybind_toggles_blast_radius_without_touching_selection() {
+        // PRD #35 acceptance criterion: `B` flips the dim state and leaves
+        // the selection alone. Starting from a selected node with the dim
+        // armed, two presses must round-trip (armed → off → armed) while
+        // `self.selected` stays pinned to the same node the whole time.
+        let mut app = app_with_graph(abc_cycle_graph());
+        app.selected = Some("a".to_string());
+        app.blast_radius_active = true;
+
+        app.dispatch_shortcut(ShortcutAction::ToggleBlastRadius);
+        assert!(
+            !app.blast_radius_active,
+            "first B press must turn the dim off"
+        );
+        assert_eq!(
+            app.selected,
+            Some("a".to_string()),
+            "B must not deselect — the user is toggling dim, not picking a new node"
+        );
+
+        app.dispatch_shortcut(ShortcutAction::ToggleBlastRadius);
+        assert!(
+            app.blast_radius_active,
+            "second B press must turn the dim back on"
+        );
+        assert_eq!(
+            app.selected,
+            Some("a".to_string()),
+            "B must still not deselect on the second press"
+        );
+    }
+
+    #[test]
+    fn escape_deselects_and_implicitly_clears_blast_radius() {
+        // Escape deselects; with no selection there's no cone to dim, so
+        // the blast-radius state is implicitly neutral. PRD #35: "Escape
+        // deselects and clears everything." The dim flag itself can stay
+        // `true` (it's the default) — observable behavior is that the
+        // canvas re-lights every node because `self.selected` is `None`.
+        let mut app = app_with_graph(abc_cycle_graph());
+        app.selected = Some("a".to_string());
+        app.blast_radius_active = true;
+
+        app.dispatch_shortcut(ShortcutAction::Dismiss);
+        assert!(
+            app.selected.is_none(),
+            "Escape with no overlay open must clear the selection"
+        );
+        assert!(
+            app.highlight.is_none(),
+            "Escape must also clear the one-hop highlight"
+        );
+    }
+
+    #[test]
+    fn fresh_app_defaults_blast_radius_on() {
+        // Default state is "dim is armed" — the first selection immediately
+        // shows the cone per the PRD's "on by default when selecting" rule.
+        let app = GruffApp::default();
+        assert!(app.blast_radius_active);
+    }
+
+    #[test]
+    fn b_registry_entry_is_wired_to_toggle_blast_radius() {
+        // Registry source-of-truth regression: the `B` row must point at
+        // the `ToggleBlastRadius` action after this issue, not the old
+        // `Noop` placeholder left by #33. A future refactor that drops
+        // the wiring would silently leave `B` as a no-op; this test is
+        // the tripwire.
+        let entry = shortcuts::SHORTCUTS
+            .iter()
+            .find(|s| s.keys == "B")
+            .expect("B must appear in the registry");
+        assert_eq!(entry.group, ShortcutGroup::View);
+        assert_eq!(entry.action, ShortcutAction::ToggleBlastRadius);
     }
 
     #[test]

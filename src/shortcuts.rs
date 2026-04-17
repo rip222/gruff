@@ -70,8 +70,7 @@ impl ShortcutGroup {
 
 /// Dispatch target for a shortcut. Commit 2 wires the registry-driven
 /// dispatcher to match on these; `Noop` is a placeholder for entries that
-/// are registered for documentation but not yet wired (the `B` toggle comes
-/// in issue #35; the `?` toggle gets its real variant in commit 4).
+/// are registered for documentation but not yet wired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShortcutAction {
     /// Open a folder via picker (Cmd+O).
@@ -86,6 +85,10 @@ pub enum ShortcutAction {
     FitView,
     /// Dismiss whichever overlay is open, else clear selection (Escape).
     Dismiss,
+    /// Toggle the blast-radius dim on the current selection (`B`). Flips
+    /// the dim state without affecting the selection itself — see
+    /// `GruffApp::blast_radius_active`.
+    ToggleBlastRadius,
     /// Toggle the keyboard-shortcut cheat-sheet modal (`?` / Shift+/).
     ToggleHelp,
     /// Reserved entry — dispatch is handled elsewhere or not yet wired.
@@ -167,9 +170,6 @@ fn parse_keys(keys: &str) -> Option<KeyPress> {
 
 /// The registry. Single source of truth for (keys, label, group, action)
 /// across the whole app.
-///
-/// `B` (View) and `?` (Help) are placeholders per PRD #33 — `B`'s handler
-/// lands in issue #35, `?`'s in commit 4 of this PRD.
 pub const SHORTCUTS: &[Shortcut] = &[
     Shortcut {
         keys: "Cmd+O",
@@ -207,12 +207,11 @@ pub const SHORTCUTS: &[Shortcut] = &[
         group: ShortcutGroup::View,
         action: ShortcutAction::TogglePhysics,
     },
-    // Placeholder — issue #35 wires this to toggle barrel collapse.
     Shortcut {
         keys: "B",
-        label: "Toggle barrel collapse",
+        label: "Toggle blast-radius dim on selection",
         group: ShortcutGroup::View,
-        action: ShortcutAction::Noop,
+        action: ShortcutAction::ToggleBlastRadius,
     },
     // No keyboard shortcut today — the file-visibility toggles live in the
     // sidebar as per-file checkboxes. Documented here so the help modal has

@@ -283,6 +283,12 @@ impl GruffApp {
                 if let Some(node) = self.pick_node(click_pos, center, ui) {
                     self.highlight = Some(self.build_node_highlight(&node));
                     self.selected = Some(node);
+                    // Every fresh selection arms the blast-radius dim per
+                    // PRD #35's "dim is on-by-default when selecting"
+                    // decision. A prior `B` press that toggled the dim off
+                    // was scoped to the previous selection — re-clicking
+                    // re-arms without the user having to press `B` again.
+                    self.blast_radius_active = true;
                 } else {
                     self.selected = None;
                     self.highlight = None;
