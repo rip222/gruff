@@ -42,12 +42,7 @@ impl GruffApp {
     /// — nodes that share a parent with the clicked node but aren't on its
     /// chain — are excluded.
     pub(super) fn build_node_highlight(&self, node: &NodeId) -> PathHighlight {
-        compute_node_highlight(
-            node,
-            &self.graph.edges,
-            &self.imports,
-            &self.imported_by,
-        )
+        compute_node_highlight(node, &self.graph.edges, &self.imports, &self.imported_by)
     }
 }
 

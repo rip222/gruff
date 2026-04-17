@@ -77,8 +77,7 @@ impl GruffApp {
         let Some(cycle) = self.cycles.get(idx) else {
             return;
         };
-        let Some(bbox) =
-            Bbox::from_points(cycle.iter().filter_map(|id| self.layout.get(id)))
+        let Some(bbox) = Bbox::from_points(cycle.iter().filter_map(|id| self.layout.get(id)))
         else {
             return;
         };
@@ -169,9 +168,7 @@ impl GruffApp {
             // `layout.get` also returns `None` for hidden nodes (they were
             // removed by `resync_layout`), which is already enough to skip,
             // but being explicit matches the render loop below.
-            if self.filter_state.is_hidden(&edge.from)
-                || self.filter_state.is_hidden(&edge.to)
-            {
+            if self.filter_state.is_hidden(&edge.from) || self.filter_state.is_hidden(&edge.to) {
                 continue;
             }
             let (Some(pa), Some(pb)) = (self.layout.get(&edge.from), self.layout.get(&edge.to))
@@ -346,9 +343,7 @@ impl GruffApp {
         // explicit and avoids allocating a position that we'd immediately
         // throw away.
         for edge in &self.graph.edges {
-            if self.filter_state.is_hidden(&edge.from)
-                || self.filter_state.is_hidden(&edge.to)
-            {
+            if self.filter_state.is_hidden(&edge.from) || self.filter_state.is_hidden(&edge.to) {
                 continue;
             }
             let (Some(pa), Some(pb)) = (self.layout.get(&edge.from), self.layout.get(&edge.to))

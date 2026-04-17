@@ -183,27 +183,16 @@ mod tests {
             .map(|n| (n.id.as_str(), n.node_type.clone()))
             .collect();
         assert_eq!(type_by_id["src/a.ts"], ExportedNodeType::Workspace);
-        assert_eq!(
-            type_by_id["src/types.d.ts"],
-            ExportedNodeType::Declaration
-        );
+        assert_eq!(type_by_id["src/types.d.ts"], ExportedNodeType::Declaration);
         assert_eq!(type_by_id["external:react"], ExportedNodeType::External);
-        assert_eq!(
-            type_by_id["package:@org/app"],
-            ExportedNodeType::Workspace
-        );
+        assert_eq!(type_by_id["package:@org/app"], ExportedNodeType::Workspace);
     }
 
     #[test]
     fn emits_workspace_relative_paths_for_files() {
         let root = PathBuf::from("/repo");
         let mut g = Graph::new();
-        g.add_node(file_node(
-            "src/a.ts",
-            "src/a.ts",
-            Some("@org/app"),
-            &root,
-        ));
+        g.add_node(file_node("src/a.ts", "src/a.ts", Some("@org/app"), &root));
 
         let exported = build_export(&g, &[], Some(&root));
         assert_eq!(exported.nodes[0].path, "src/a.ts");

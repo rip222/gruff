@@ -3,8 +3,8 @@ use eframe::egui;
 use crate::colors;
 use crate::graph::{NodeId, NodeKind};
 use crate::package_tree::{
-    CheckState, ExternalsBucket, FolderChild, FolderNode, PackageNode, PackageTree,
-    UnpackagedBucket, EXTERNALS_LABEL, UNPACKAGED_LABEL,
+    CheckState, EXTERNALS_LABEL, ExternalsBucket, FolderChild, FolderNode, PackageNode,
+    PackageTree, UNPACKAGED_LABEL, UnpackagedBucket,
 };
 
 use super::GruffApp;
@@ -242,11 +242,8 @@ impl GruffApp {
 /// through `toggles`.
 fn draw_package_node(ui: &mut egui::Ui, pkg: &PackageNode, toggles: &mut Vec<NodeId>) {
     let id = ui.make_persistent_id(format!("pkg-tree:pkg:{}", pkg.name));
-    let state = egui::collapsing_header::CollapsingState::load_with_default_open(
-        ui.ctx(),
-        id,
-        false,
-    );
+    let state =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
     let check_id = format!("pkg-check:{}", pkg.name);
     state
         .show_header(ui, |ui| {
@@ -297,11 +294,8 @@ fn draw_folder_node(
 ) {
     let salt = format!("{parent_salt}:folder:{}", folder.name);
     let id = ui.make_persistent_id(format!("pkg-tree:{salt}"));
-    let state = egui::collapsing_header::CollapsingState::load_with_default_open(
-        ui.ctx(),
-        id,
-        false,
-    );
+    let state =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
     let check_id = format!("{salt}:check");
     state
         .show_header(ui, |ui| {
@@ -318,18 +312,11 @@ fn draw_folder_node(
         });
 }
 
-fn draw_unpackaged_bucket(
-    ui: &mut egui::Ui,
-    bucket: &UnpackagedBucket,
-    toggles: &mut Vec<NodeId>,
-) {
+fn draw_unpackaged_bucket(ui: &mut egui::Ui, bucket: &UnpackagedBucket, toggles: &mut Vec<NodeId>) {
     let salt = "unpackaged";
     let id = ui.make_persistent_id("pkg-tree:unpackaged");
-    let state = egui::collapsing_header::CollapsingState::load_with_default_open(
-        ui.ctx(),
-        id,
-        false,
-    );
+    let state =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
     state
         .show_header(ui, |ui| {
             // Bucket-level checkbox cascades over the flat file list.
@@ -355,18 +342,11 @@ fn draw_unpackaged_bucket(
         });
 }
 
-fn draw_externals_bucket(
-    ui: &mut egui::Ui,
-    bucket: &ExternalsBucket,
-    toggles: &mut Vec<NodeId>,
-) {
+fn draw_externals_bucket(ui: &mut egui::Ui, bucket: &ExternalsBucket, toggles: &mut Vec<NodeId>) {
     let salt = "externals";
     let id = ui.make_persistent_id("pkg-tree:externals");
-    let state = egui::collapsing_header::CollapsingState::load_with_default_open(
-        ui.ctx(),
-        id,
-        false,
-    );
+    let state =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
     state
         .show_header(ui, |ui| {
             // Externals bucket cascades the same way — externals share the
@@ -408,9 +388,8 @@ fn draw_tristate_check(ui: &mut egui::Ui, id: &str, state: CheckState) -> bool {
         ui.push_id(id, |ui| {
             let mut checked = matches!(state, CheckState::Checked);
             let indeterminate = matches!(state, CheckState::Mixed);
-            let response = ui.add(
-                egui::Checkbox::new(&mut checked, "").indeterminate(indeterminate),
-            );
+            let response =
+                ui.add(egui::Checkbox::new(&mut checked, "").indeterminate(indeterminate));
             if response.changed() {
                 toggled = true;
             }

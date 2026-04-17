@@ -129,10 +129,7 @@ mod tests {
 
     #[test]
     fn nested_deep_index_tsx_becomes_deep() {
-        assert_eq!(
-            display_label(&file_node("nested/deep/index.tsx")),
-            "deep"
-        );
+        assert_eq!(display_label(&file_node("nested/deep/index.tsx")), "deep");
     }
 
     #[test]

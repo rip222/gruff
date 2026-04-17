@@ -1,3 +1,4 @@
+pub mod aggregation;
 pub mod app;
 pub mod camera;
 pub mod colors;

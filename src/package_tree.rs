@@ -236,10 +236,7 @@ impl PackageTree {
                     // subtree already represents the package.
                 }
                 NodeKind::File => match node.package.as_deref() {
-                    Some(name) => by_package
-                        .entry(name.to_string())
-                        .or_default()
-                        .push(node),
+                    Some(name) => by_package.entry(name.to_string()).or_default().push(node),
                     None => unpackaged.push(node),
                 },
             }
@@ -714,8 +711,7 @@ mod tests {
             FolderChild::Folder(f) => &f.children,
             _ => panic!("expected `deep` to be a folder"),
         };
-        let deep_labels: Vec<&str> =
-            deep_children.iter().map(FolderChild::sort_key).collect();
+        let deep_labels: Vec<&str> = deep_children.iter().map(FolderChild::sort_key).collect();
         assert_eq!(deep_labels, vec!["c.ts"]);
     }
 
@@ -739,10 +735,7 @@ mod tests {
             FolderChild::Folder(f) => &f.children,
             _ => panic!("expected `utils` to be a folder"),
         };
-        let utils_labels: Vec<&str> = utils_children
-            .iter()
-            .map(FolderChild::sort_key)
-            .collect();
+        let utils_labels: Vec<&str> = utils_children.iter().map(FolderChild::sort_key).collect();
         assert_eq!(utils_labels, vec!["helper.ts"]);
     }
 

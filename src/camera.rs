@@ -396,9 +396,7 @@ mod tests {
     fn distance_to_target(cam: &Camera) -> f32 {
         let v = cam.view();
         let t = cam.target();
-        (v.center.x - t.center.x).abs()
-            + (v.center.y - t.center.y).abs()
-            + (v.zoom - t.zoom).abs()
+        (v.center.x - t.center.x).abs() + (v.center.y - t.center.y).abs() + (v.zoom - t.zoom).abs()
     }
 
     #[test]

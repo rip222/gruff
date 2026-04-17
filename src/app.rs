@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
+use crate::aggregation::{self, TsBarrelAggregator};
 use crate::camera::Camera;
 use crate::colors;
 use crate::config::{self, Config};
@@ -188,7 +189,7 @@ impl GruffApp {
         if indexer.options.include_tests != self.include_tests {
             indexer.set_include_tests(self.include_tests);
         }
-        self.graph = indexer.graph.clone();
+        self.graph = aggregated_graph(&indexer);
         self.unresolved_dynamic = indexer.unresolved_dynamic;
         let root = indexer.ws.root.clone();
         self.last_root = Some(root.clone());
@@ -268,7 +269,7 @@ impl GruffApp {
         };
         let start = Instant::now();
         indexer.set_include_tests(include);
-        self.graph = indexer.graph.clone();
+        self.graph = aggregated_graph(indexer);
         self.unresolved_dynamic = indexer.unresolved_dynamic;
         self.rebuild_derived_indexes();
         self.resync_layout();
@@ -293,7 +294,7 @@ impl GruffApp {
         let start = Instant::now();
         if let Some(indexer) = self.indexer.as_mut() {
             indexer.rescan();
-            self.graph = indexer.graph.clone();
+            self.graph = aggregated_graph(indexer);
             self.unresolved_dynamic = indexer.unresolved_dynamic;
         } else {
             // No indexer yet (shouldn't happen with a non-empty last_root),
@@ -396,9 +397,7 @@ impl GruffApp {
             g.add_node(node.clone());
         }
         for edge in &self.graph.edges {
-            if self.filter_state.is_hidden(&edge.from)
-                || self.filter_state.is_hidden(&edge.to)
-            {
+            if self.filter_state.is_hidden(&edge.from) || self.filter_state.is_hidden(&edge.to) {
                 continue;
             }
             g.add_edge(&edge.from, &edge.to);
@@ -544,8 +543,7 @@ impl GruffApp {
         // graph here so the exported JSON stays consistent with its nodes
         // and edges.
         let full_cycles = self.graph.cycles();
-        let exported =
-            export::build_export(&self.graph, &full_cycles, self.last_root.as_deref());
+        let exported = export::build_export(&self.graph, &full_cycles, self.last_root.as_deref());
         match export::write_json(&target, &exported) {
             Ok(()) => {
                 self.status = format!(
@@ -589,7 +587,13 @@ impl GruffApp {
         if combined.is_empty() {
             return false;
         }
-        self.graph.apply(&combined);
+        // Barrel aggregation has to run over the full post-diff graph — a
+        // single file change can promote a folder to a barrel (new index.ts)
+        // or demote it, which the per-edge raw diff can't express on its own.
+        // Re-aggregating is cheap relative to the parse work the indexer just
+        // did, and `Layout::sync` below preserves positions for nodes whose
+        // id didn't change so the view stays stable.
+        self.graph = aggregated_graph(indexer);
         self.unresolved_dynamic = indexer.unresolved_dynamic;
 
         // Layout's `sync` preserves existing node positions and seeds new
@@ -636,6 +640,15 @@ impl GruffApp {
 /// `read_dir` implies existence, readability, and that it isn't a plain file.
 fn is_readable_dir(path: &std::path::Path) -> bool {
     std::fs::read_dir(path).is_ok()
+}
+
+/// Run the barrel aggregator over the indexer's raw graph and return the
+/// display-level graph the UI actually renders. Called at every point where
+/// the app refreshes its live graph from the indexer — full load, rescan,
+/// test-toggle, and watcher pumps.
+fn aggregated_graph(indexer: &Indexer) -> Graph {
+    let ctx = aggregation::context_from_workspace(&indexer.ws, &indexer.ctx);
+    aggregation::apply_aggregation(&indexer.graph, &ctx, &TsBarrelAggregator::new())
 }
 
 /// Append `src` into `dst`, preserving ordering (removals first, additions
@@ -981,8 +994,7 @@ mod tests {
             1,
             "hiding `a` must leave exactly the {{c,d,e}} cycle"
         );
-        let remaining: std::collections::BTreeSet<_> =
-            app.cycles[0].iter().cloned().collect();
+        let remaining: std::collections::BTreeSet<_> = app.cycles[0].iter().cloned().collect();
         let expected: std::collections::BTreeSet<_> =
             ["c", "d", "e"].iter().map(|s| s.to_string()).collect();
         assert_eq!(remaining, expected);
