@@ -262,6 +262,31 @@ impl GruffApp {
             }
         }
 
+        // Overlap resolution: once the simulation has come to rest, iteratively
+        // separate overlapping rectangles so no two labels collide. Runs once
+        // per settle — any `resync_layout` clears `overlap_resolved` so the
+        // next re-kick (watcher diff, filter toggle, fresh folder) triggers
+        // another pass after the sim re-settles. Positions shift as a side
+        // effect; a final fit-all keeps the camera framed on the expanded
+        // bounds. We deliberately don't fight the running sim — the physics
+        // step above may push nodes back into overlap on the very next tick,
+        // which is fine: we'll re-run once things quiet down again after the
+        // next re-kick.
+        if !self.overlap_resolved && self.layout.max_velocity() < super::SETTLED_VELOCITY {
+            let sizes: Vec<Vec2> = self
+                .layout
+                .iter()
+                .map(|(id, _)| self.node_render_size_world(id, ui))
+                .collect();
+            self.layout.resolve_overlaps(&sizes);
+            self.overlap_resolved = true;
+            // Graph bounds may have expanded; re-fit so the user sees the
+            // post-resolution layout instead of a cropped view. Tween so the
+            // motion reads as "relaxation" rather than a jump cut.
+            self.fit_request = Some(FitMode::Tween);
+            ctx.request_repaint();
+        }
+
         // Advance any in-flight tween. `is_settled` short-circuits when
         // current == target so this is free on frames with no animation.
         if !self.camera.is_settled() {

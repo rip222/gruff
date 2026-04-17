@@ -68,6 +68,15 @@ pub struct Layout {
     /// 0 disables clustering entirely. Typical values are small (0.01–0.05)
     /// because the force is multiplied by `k` and distance-from-centroid.
     pub cluster_strength: f32,
+    /// Coulomb-style repulsion between *package centroids*. Pushes whole
+    /// packages apart so visible whitespace opens up between clusters at
+    /// default zoom — the intra-package cluster pull keeps members together
+    /// while this term keeps neighboring packages from bleeding into one
+    /// another. 0 disables the term; typical values are a modest multiple of
+    /// the per-body `k_sq` so the inter-package spacing dominates on graphs
+    /// with many packages. See PRD #24 "Layout: overlap resolution and
+    /// package spacing".
+    pub package_repulsion: f32,
 }
 
 impl Default for Layout {
@@ -88,11 +97,12 @@ impl Layout {
             groups: Vec::new(),
             group_count: 0,
             k: 55.0,
-            gravity: 0.03,
+            gravity: 0.025,
             damping: 0.82,
             max_speed: 400.0,
             theta: 1.0,
-            cluster_strength: 0.02,
+            cluster_strength: 0.05,
+            package_repulsion: 8.0,
         }
     }
 
@@ -215,6 +225,17 @@ impl Layout {
         }
     }
 
+    /// Run the overlap resolver against the current positions using the given
+    /// per-node rendered sizes (parallel to the layout's internal node order —
+    /// use [`Layout::iter`] or the index yielded by [`Layout::get`] to build
+    /// the slice). Caller is responsible for picking the moment to invoke
+    /// this — typically when the simulation is settled per
+    /// [`Layout::max_velocity`] — since the resolver only guarantees a
+    /// non-overlapping snapshot, not equilibrium under the running sim.
+    pub fn resolve_overlaps(&mut self, sizes: &[Vec2]) {
+        overlap::resolve(&mut self.positions, sizes);
+    }
+
     /// Advance the simulation by one step using Fruchterman-Reingold forces
     /// with Barnes-Hut approximation for repulsion.
     pub fn step(&mut self, dt: f32) {
@@ -261,7 +282,14 @@ impl Layout {
         // Package-aware clustering: pull each grouped node toward its group's
         // centroid. Keeps the data model flat (no container rendering) while
         // producing visible clusters in the force-directed layout.
-        if self.cluster_strength > 0.0 && self.group_count > 0 {
+        //
+        // Same pass also applies the inter-package centroid repulsion term: once
+        // centroids are computed we treat each as a meta-body and have them
+        // repel each other, then redistribute the resulting force uniformly to
+        // every member of the pushed package. This opens visible whitespace
+        // between packages at default zoom without preventing normal per-node
+        // dynamics inside a package.
+        if self.group_count > 0 {
             let mut sum = vec![Vec2::default(); self.group_count];
             let mut count = vec![0u32; self.group_count];
             for i in 0..n {
@@ -271,16 +299,67 @@ impl Layout {
                     count[idx] += 1;
                 }
             }
-            let gain = self.cluster_strength * k;
-            for i in 0..n {
-                if let Some(g) = self.groups[i] {
-                    let idx = g as usize;
-                    if count[idx] > 1 {
-                        let inv = 1.0 / count[idx] as f32;
-                        let cx = sum[idx].x * inv;
-                        let cy = sum[idx].y * inv;
-                        forces[i].x += (cx - self.positions[i].x) * gain;
-                        forces[i].y += (cy - self.positions[i].y) * gain;
+
+            // Centroid-pull.
+            if self.cluster_strength > 0.0 {
+                let gain = self.cluster_strength * k;
+                for i in 0..n {
+                    if let Some(g) = self.groups[i] {
+                        let idx = g as usize;
+                        if count[idx] > 1 {
+                            let inv = 1.0 / count[idx] as f32;
+                            let cx = sum[idx].x * inv;
+                            let cy = sum[idx].y * inv;
+                            forces[i].x += (cx - self.positions[i].x) * gain;
+                            forces[i].y += (cy - self.positions[i].y) * gain;
+                        }
+                    }
+                }
+            }
+
+            // Inter-package centroid repulsion. O(g²) in the group count, which
+            // is fine — g is workspace-package count, typically small.
+            if self.package_repulsion > 0.0 && self.group_count > 1 {
+                let mut centroids = vec![Vec2::default(); self.group_count];
+                for g in 0..self.group_count {
+                    if count[g] > 0 {
+                        let inv = 1.0 / count[g] as f32;
+                        centroids[g] = Vec2::new(sum[g].x * inv, sum[g].y * inv);
+                    }
+                }
+                let mut group_force = vec![Vec2::default(); self.group_count];
+                let strength = self.package_repulsion * k_sq;
+                for a in 0..self.group_count {
+                    if count[a] == 0 {
+                        continue;
+                    }
+                    for b in (a + 1)..self.group_count {
+                        if count[b] == 0 {
+                            continue;
+                        }
+                        let dx = centroids[a].x - centroids[b].x;
+                        let dy = centroids[a].y - centroids[b].y;
+                        let dist_sq = (dx * dx + dy * dy).max(min_dist_sq);
+                        let dist = dist_sq.sqrt();
+                        let mag = strength / dist;
+                        let fx = dx / dist * mag;
+                        let fy = dy / dist * mag;
+                        group_force[a].x += fx;
+                        group_force[a].y += fy;
+                        group_force[b].x -= fx;
+                        group_force[b].y -= fy;
+                    }
+                }
+                // Distribute each package's force uniformly across its members
+                // so the whole cluster translates rather than deforming.
+                for i in 0..n {
+                    if let Some(g) = self.groups[i] {
+                        let idx = g as usize;
+                        if count[idx] > 0 {
+                            let inv = 1.0 / count[idx] as f32;
+                            forces[i].x += group_force[idx].x * inv;
+                            forces[i].y += group_force[idx].y * inv;
+                        }
                     }
                 }
             }
@@ -572,6 +651,82 @@ fn quadrant(p: Vec2, cx: f32, cy: f32) -> usize {
         (false, true) => 2,  // SW
         (true, true) => 3,   // SE
     }
+}
+
+// --- Overlap resolver -------------------------------------------------------
+
+pub mod overlap {
+    //! Iterative AABB separation. Once the force simulation settles, call
+    //! [`resolve`] with the current positions and each node's rendered
+    //! rectangle size (label size + padding). Overlapping pairs are pushed
+    //! apart along their shorter-overlap axis by half the overlap each, and
+    //! the sweep repeats until no rectangle pair overlaps — or until the
+    //! iteration cap trips, which is a belt-and-braces safety net for
+    //! pathological inputs rather than an expected outcome.
+
+    use super::Vec2;
+
+    /// Hard upper bound on resolver sweeps. Overlap resolution converges fast
+    /// on realistic graphs (a few hundred sweeps for hundreds of nodes); the
+    /// cap exists so a degenerate input can't hang the app loop.
+    const MAX_ITERATIONS: usize = 500;
+
+    /// Tiny epsilon (world units) treated as non-overlap — floats that sit
+    /// exactly flush after a separation step shouldn't re-trigger another
+    /// sweep. Well below the smallest rendered rect dimension.
+    const OVERLAP_EPS: f32 = 1e-3;
+
+    /// Mutate `positions` in place until no two AABBs defined by
+    /// `(positions[i], sizes[i])` (centered rectangles) overlap. `sizes` must
+    /// be parallel to `positions`; mismatched lengths fall back to the
+    /// shorter of the two so the function is impossible to misuse into an
+    /// index panic.
+    pub fn resolve(positions: &mut [Vec2], sizes: &[Vec2]) {
+        let n = positions.len().min(sizes.len());
+        if n < 2 {
+            return;
+        }
+
+        for _ in 0..MAX_ITERATIONS {
+            let mut any_overlap = false;
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let dx = positions[j].x - positions[i].x;
+                    let dy = positions[j].y - positions[i].y;
+                    let min_gap_x = (sizes[i].x + sizes[j].x) * 0.5;
+                    let min_gap_y = (sizes[i].y + sizes[j].y) * 0.5;
+                    let overlap_x = min_gap_x - dx.abs();
+                    let overlap_y = min_gap_y - dy.abs();
+                    if overlap_x <= OVERLAP_EPS || overlap_y <= OVERLAP_EPS {
+                        continue;
+                    }
+                    any_overlap = true;
+                    // Push apart along the shorter-overlap axis — the minimum
+                    // translation vector for the pair. Each body moves half
+                    // the overlap so the pair's midpoint is preserved.
+                    if overlap_x < overlap_y {
+                        let shift = overlap_x * 0.5;
+                        // Sign: if dx >= 0 then j is to the right of i; push j
+                        // further right and i further left. Zero dx (exact
+                        // coincidence along this axis) gets a deterministic
+                        // tiebreaker so coincident rects still separate.
+                        let sign = if dx >= 0.0 { 1.0 } else { -1.0 };
+                        positions[i].x -= shift * sign;
+                        positions[j].x += shift * sign;
+                    } else {
+                        let shift = overlap_y * 0.5;
+                        let sign = if dy >= 0.0 { 1.0 } else { -1.0 };
+                        positions[i].y -= shift * sign;
+                        positions[j].y += shift * sign;
+                    }
+                }
+            }
+            if !any_overlap {
+                return;
+            }
+        }
+    }
+
 }
 
 #[cfg(test)]

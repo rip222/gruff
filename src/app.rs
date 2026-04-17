@@ -105,6 +105,12 @@ pub struct GruffApp {
     /// session, or until the next folder open). See PRD #16's "Camera
     /// settle + fit flow at load" for the full state machine.
     auto_refit: bool,
+    /// True once the overlap resolver has run against the current settled
+    /// layout. Cleared every time the layout is re-synced (new graph, filter
+    /// toggle, watcher-driven diff) so the next settle re-runs the resolver.
+    /// Without this flag the resolver would run every frame the sim happened
+    /// to be quiet, wastefully mutating positions that are already clean.
+    overlap_resolved: bool,
     sim_enabled: bool,
     status: String,
     /// Count of fully-unresolvable dynamic imports (e.g. `import(modName)`)
@@ -159,6 +165,7 @@ impl Default for GruffApp {
             selected: None,
             camera: Camera::new(),
             auto_refit: false,
+            overlap_resolved: false,
             sim_enabled: true,
             status: String::new(),
             unresolved_dynamic: 0,
@@ -227,6 +234,7 @@ impl GruffApp {
 
         self.layout = Layout::new();
         self.layout.sync(&self.visible_graph());
+        self.overlap_resolved = false;
         self.selected = None;
         self.camera = Camera::new();
         // Run physics synchronously up to ~500 ticks / ~300 ms so the first
@@ -469,6 +477,10 @@ impl GruffApp {
         } else {
             self.layout.sync(&self.visible_graph());
         }
+        // Any re-sync invalidates the previous "no overlap" guarantee —
+        // positions just shifted (new nodes, removed nodes, or a freshly
+        // re-kicked sim), so the resolver must run again on the next settle.
+        self.overlap_resolved = false;
     }
 
     /// React to a file-level filter toggle: drop hidden nodes from the
