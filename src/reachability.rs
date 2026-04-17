@@ -144,6 +144,47 @@ fn enqueue_and_expand(
     }
 }
 
+/// Set of nodes unreachable from any of `entries` via a forward walk. A node
+/// `n` is in the returned set iff there is NO directed chain
+/// `e -> ... -> n` starting at some `e ∈ entries`. Equivalent to the
+/// complement of the forward-BFS visited set, restricted to the graph's own
+/// nodes so external / synthetic ids never leak into the returned set.
+///
+/// Entries absent from `graph.nodes` are silently skipped — they can't seed
+/// any walk, so they only matter as "did the caller hand us a stale id?"
+/// which isn't this function's concern. Entries that ARE in `graph.nodes`
+/// count as visited themselves (an entry reaches itself), so the returned
+/// set never contains an entry id.
+///
+/// Iterative forward BFS over `graph.edges` mirrors the style of
+/// `transitive_dependents` — no reverse-adjacency cache needed for the graph
+/// sizes this tool targets, and keeping the walk pure means tests can drive
+/// it directly without standing up an app.
+pub fn unreachable_from(graph: &Graph, entries: &HashSet<NodeId>) -> HashSet<NodeId> {
+    let mut visited: HashSet<NodeId> = HashSet::new();
+    let mut queue: VecDeque<NodeId> = VecDeque::new();
+    for entry in entries {
+        if graph.nodes.contains_key(entry) && visited.insert(entry.clone()) {
+            queue.push_back(entry.clone());
+        }
+    }
+    while let Some(cur) = queue.pop_front() {
+        for edge in &graph.edges {
+            if edge.from == cur && visited.insert(edge.to.clone()) {
+                queue.push_back(edge.to.clone());
+            }
+        }
+    }
+
+    let mut unreachable: HashSet<NodeId> = HashSet::new();
+    for id in graph.nodes.keys() {
+        if !visited.contains(id) {
+            unreachable.insert(id.clone());
+        }
+    }
+    unreachable
+}
+
 /// Summarise a transitive-dependents cone as `(file_count, package_count)` —
 /// the two numbers the blast-radius status bar renders as
 /// "N files in M packages depend on this."
@@ -562,5 +603,116 @@ mod tests {
         let with_empty =
             transitive_dependents_with_barrels(&g, &"c".to_string(), &BarrelMembers::empty());
         assert_eq!(plain, with_empty);
+    }
+
+    // --- unreachable_from -------------------------------------------------
+
+    /// Every node reachable from some entry → empty unreachable set. The
+    /// chain `entry -> a -> b -> c` leaves nothing dead when `entry` is in
+    /// the entry set.
+    #[test]
+    fn unreachable_from_entries_cover_all_returns_empty() {
+        let mut g = Graph::new();
+        for id in ["entry", "a", "b", "c"] {
+            g.add_node(file_node(id));
+        }
+        g.add_edge("entry", "a");
+        g.add_edge("a", "b");
+        g.add_edge("b", "c");
+
+        let mut entries = HashSet::new();
+        entries.insert("entry".to_string());
+        let dead = unreachable_from(&g, &entries);
+        assert!(
+            dead.is_empty(),
+            "entire chain is reachable from the single entry; got {dead:?}"
+        );
+    }
+
+    /// No entries at all → every node in the graph is unreachable. Mirrors
+    /// the PRD's "entries cover none → all-nodes return" matrix row.
+    #[test]
+    fn unreachable_from_empty_entries_returns_every_node() {
+        let mut g = Graph::new();
+        for id in ["a", "b", "c"] {
+            g.add_node(file_node(id));
+        }
+        g.add_edge("a", "b");
+
+        let entries: HashSet<NodeId> = HashSet::new();
+        let dead = unreachable_from(&g, &entries);
+        let expected: HashSet<NodeId> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(dead, expected);
+    }
+
+    /// A disconnected island (no edges to or from the reachable component)
+    /// stays unreachable. The reachable component's nodes don't leak into
+    /// the returned set.
+    #[test]
+    fn unreachable_from_island_disconnected_from_entries_stays_dead() {
+        let mut g = Graph::new();
+        for id in ["entry", "live", "island_a", "island_b"] {
+            g.add_node(file_node(id));
+        }
+        g.add_edge("entry", "live");
+        // Island: two files importing each other with no tie back to entry.
+        g.add_edge("island_a", "island_b");
+        g.add_edge("island_b", "island_a");
+
+        let mut entries = HashSet::new();
+        entries.insert("entry".to_string());
+        let dead = unreachable_from(&g, &entries);
+        let expected: HashSet<NodeId> =
+            ["island_a", "island_b"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            dead, expected,
+            "only the disconnected island should show up as unreachable"
+        );
+    }
+
+    /// A cycle rooted off an entry is wholly reachable — every cycle member
+    /// gets visited via the entry and so stays out of the dead set, even
+    /// though internally they form an SCC.
+    #[test]
+    fn unreachable_from_cycle_reachable_from_entry_is_excluded() {
+        // entry -> a -> b -> c -> a (back-edge). Every cycle member is
+        // reachable from entry.
+        let mut g = Graph::new();
+        for id in ["entry", "a", "b", "c"] {
+            g.add_node(file_node(id));
+        }
+        g.add_edge("entry", "a");
+        g.add_edge("a", "b");
+        g.add_edge("b", "c");
+        g.add_edge("c", "a");
+
+        let mut entries = HashSet::new();
+        entries.insert("entry".to_string());
+        let dead = unreachable_from(&g, &entries);
+        assert!(
+            dead.is_empty(),
+            "every cycle member is reachable via entry; got {dead:?}",
+        );
+    }
+
+    /// Entries that aren't in `graph.nodes` are silently ignored — they
+    /// can't seed a walk, so a stale entry id in the input set doesn't
+    /// turn a live graph into "all unreachable."
+    #[test]
+    fn unreachable_from_unknown_entry_is_ignored() {
+        let mut g = Graph::new();
+        for id in ["live_entry", "a"] {
+            g.add_node(file_node(id));
+        }
+        g.add_edge("live_entry", "a");
+
+        let mut entries = HashSet::new();
+        entries.insert("live_entry".to_string());
+        entries.insert("ghost".to_string());
+        let dead = unreachable_from(&g, &entries);
+        assert!(
+            dead.is_empty(),
+            "ghost entry should not affect the result; got {dead:?}",
+        );
     }
 }
