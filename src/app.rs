@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use crate::aggregation::{self, PassthroughAggregator, TsBarrelAggregator};
+use crate::aggregation::{self, BarrelMembers, PassthroughAggregator, TsBarrelAggregator};
 use crate::camera::Camera;
 use crate::colors;
 use crate::config::{self, Config};
@@ -15,6 +15,7 @@ use crate::graph::{Graph, GraphDiff, NodeId};
 use crate::indexer::Indexer;
 use crate::layout::Layout;
 use crate::lib_detect::{self, LibDetector, TsLibDetector};
+use crate::reachability;
 use crate::shortcuts::{self, KeyPress, ShortcutAction, ShortcutMods};
 use crate::watcher::{ChangeEvent, Watcher};
 use crate::workspace_state::{self, WorkspaceState};
@@ -193,6 +194,18 @@ pub struct GruffApp {
     /// "on by default when selecting" per PRD #35's decision doc. Deliberately
     /// not persisted across sessions; a relaunch re-defaults to on.
     blast_radius_active: bool,
+    /// Barrel display → member file lookup, rebuilt alongside the live
+    /// graph. Consumed by the blast-radius cone so selecting a file inside
+    /// a barrel still walks upstream through the display node. Empty when
+    /// barrel collapse is off (passthrough aggregation).
+    barrel_members: BarrelMembers,
+    /// Cached transitive-dependents cone for the current selection. Built
+    /// once on selection change (or graph rebuild) and reused every frame
+    /// so the canvas doesn't re-walk edges per paint. `None` when nothing
+    /// is selected; the set is populated even if empty (isolated-node
+    /// selection), which keeps "dim with nothing lit besides self" working
+    /// correctly.
+    blast_cone: Option<std::collections::HashSet<NodeId>>,
 }
 
 impl Default for GruffApp {
@@ -228,6 +241,8 @@ impl Default for GruffApp {
             filter_state: FilterState::new(),
             show_help: false,
             blast_radius_active: true,
+            barrel_members: BarrelMembers::empty(),
+            blast_cone: None,
         }
     }
 }
@@ -281,7 +296,9 @@ impl GruffApp {
         // the aggregator. Set the flag in place; `aggregated_graph` reads
         // it on the next call.
         indexer.options.collapse_barrels = self.collapse_barrels;
-        self.graph = aggregated_graph(&indexer);
+        let (graph, members) = aggregated_graph_and_members(&indexer);
+        self.graph = graph;
+        self.barrel_members = members;
         self.unresolved_dynamic = indexer.unresolved_dynamic;
         let root = indexer.ws.root.clone();
         self.last_root = Some(root.clone());
@@ -330,6 +347,7 @@ impl GruffApp {
         self.calibrate_layout_spring_constant();
         self.overlap_resolved = false;
         self.selected = None;
+        self.blast_cone = None;
         self.camera = Camera::new();
         // Run physics synchronously up to ~500 ticks / ~300 ms so the first
         // fit frames a meaningful bounding box instead of the seed spiral.
@@ -379,7 +397,9 @@ impl GruffApp {
         };
         let start = Instant::now();
         indexer.set_include_tests(include);
-        self.graph = aggregated_graph(indexer);
+        let (graph, members) = aggregated_graph_and_members(indexer);
+        self.graph = graph;
+        self.barrel_members = members;
         self.unresolved_dynamic = indexer.unresolved_dynamic;
         self.rebuild_derived_indexes();
         self.resync_layout();
@@ -392,6 +412,10 @@ impl GruffApp {
                 self.selected = None;
             }
         }
+        // Even if selection survived, the graph shape shifted under it —
+        // the cached cone is stale. Recompute now so the next paint uses
+        // fresh edges / barrel membership.
+        self.recompute_blast_cone();
         self.set_status_after_index(start.elapsed());
     }
 
@@ -412,7 +436,9 @@ impl GruffApp {
         };
         let start = Instant::now();
         indexer.options.collapse_barrels = collapse;
-        self.graph = aggregated_graph(indexer);
+        let (graph, members) = aggregated_graph_and_members(indexer);
+        self.graph = graph;
+        self.barrel_members = members;
         self.unresolved_dynamic = indexer.unresolved_dynamic;
         self.rebuild_derived_indexes();
         self.resync_layout();
@@ -426,6 +452,10 @@ impl GruffApp {
                 self.selected = None;
             }
         }
+        // Barrel toggle reshapes both the edge set and the barrel-member
+        // lookup — refresh the cone so a still-selected node reflects its
+        // post-toggle cone rather than a stale one.
+        self.recompute_blast_cone();
         self.set_status_after_index(start.elapsed());
     }
 
@@ -438,7 +468,9 @@ impl GruffApp {
         let start = Instant::now();
         if let Some(indexer) = self.indexer.as_mut() {
             indexer.rescan();
-            self.graph = aggregated_graph(indexer);
+            let (graph, members) = aggregated_graph_and_members(indexer);
+            self.graph = graph;
+            self.barrel_members = members;
             self.unresolved_dynamic = indexer.unresolved_dynamic;
         } else {
             // No indexer yet (shouldn't happen with a non-empty last_root),
@@ -451,6 +483,7 @@ impl GruffApp {
         self.frame_request = None;
         self.highlight = None;
         self.selected = None;
+        self.blast_cone = None;
         self.set_status_after_index(start.elapsed());
     }
 
@@ -656,8 +689,13 @@ impl GruffApp {
             if self.filter_state.is_hidden(&selected) {
                 self.selected = None;
                 self.highlight = None;
+                self.blast_cone = None;
             }
         }
+        // Hiding a node that participates in another node's cone also
+        // invalidates the cone set — refresh unconditionally so the dim
+        // pass tracks the post-filter visible graph.
+        self.recompute_blast_cone();
 
         // Tween the camera to the new visible-subgraph bbox. The canvas
         // consumes this request on the next frame, which is where it has
@@ -769,6 +807,20 @@ impl GruffApp {
         self.auto_refit = false;
     }
 
+    /// Rebuild the cached blast-radius cone from the current selection.
+    /// Called after every state change that can invalidate it: selection
+    /// change, graph rebuild, barrel-toggle. `None` selection clears the
+    /// cache so the dim pass short-circuits to "nothing dimmed."
+    ///
+    /// Extracted so the canvas click handler and the app-level dispatch
+    /// can share the exact same computation, and so tests can drive it
+    /// directly without standing up an egui context.
+    pub(super) fn recompute_blast_cone(&mut self) {
+        self.blast_cone = self.selected.as_ref().map(|id| {
+            reachability::transitive_dependents_with_barrels(&self.graph, id, &self.barrel_members)
+        });
+    }
+
     /// Perform the side effects mapped to `action` by the shortcuts registry.
     /// Called by the frame loop once per matched key press. Per-action gates
     /// (overlay guards, "graph non-empty", etc.) live here so the registry
@@ -824,6 +876,10 @@ impl GruffApp {
                 } else {
                     self.selected = None;
                     self.highlight = None;
+                    // Escape clears the cone too — with nothing selected
+                    // there's no blast radius to surface, and the status
+                    // bar / canvas dim both short-circuit on `None` cone.
+                    self.blast_cone = None;
                 }
             }
             ShortcutAction::ToggleHelp => {
@@ -1000,7 +1056,9 @@ impl GruffApp {
         // Re-aggregating is cheap relative to the parse work the indexer just
         // did, and `Layout::sync` below preserves positions for nodes whose
         // id didn't change so the view stays stable.
-        self.graph = aggregated_graph(indexer);
+        let (graph, members) = aggregated_graph_and_members(indexer);
+        self.graph = graph;
+        self.barrel_members = members;
         self.unresolved_dynamic = indexer.unresolved_dynamic;
 
         // Layout's `sync` preserves existing node positions and seeds new
@@ -1017,8 +1075,12 @@ impl GruffApp {
             if !self.graph.nodes.contains_key(&selected) {
                 self.selected = None;
                 self.highlight = None;
+                self.blast_cone = None;
             }
         }
+        // Watcher diff may have changed edges under a still-live
+        // selection — refresh the cone so the cone tracks the new shape.
+        self.recompute_blast_cone();
 
         self.status = format!(
             "{} files, {} edges, {} cycle{} — live",
@@ -1127,19 +1189,49 @@ fn recent_menu_label(path: &std::path::Path) -> String {
 }
 
 /// Run the configured aggregator over the indexer's raw graph and return
-/// the display-level graph the UI actually renders. Called at every point
-/// where the app refreshes its live graph from the indexer — full load,
-/// rescan, test-toggle, barrel-toggle, and watcher pumps. The aggregator
-/// choice follows `indexer.options.collapse_barrels`: `true` runs the
-/// existing `TsBarrelAggregator`; `false` runs a passthrough so the
-/// graph stays at file-level granularity (madge's shape).
-fn aggregated_graph(indexer: &Indexer) -> Graph {
+/// the display-level graph + the barrel-membership handle it produced.
+/// Called at every point where the app refreshes its live graph from the
+/// indexer — full load, rescan, test-toggle, barrel-toggle, and watcher
+/// pumps. The aggregator choice follows `indexer.options.collapse_barrels`:
+/// `true` runs the existing `TsBarrelAggregator`; `false` runs a
+/// passthrough so the graph stays at file-level granularity (madge's
+/// shape). The passthrough branch still produces an empty membership
+/// handle so callers don't have to branch.
+fn aggregated_graph_and_members(indexer: &Indexer) -> (Graph, BarrelMembers) {
     let ctx = aggregation::context_from_workspace(&indexer.ws, &indexer.ctx);
-    if indexer.options.collapse_barrels {
-        aggregation::apply_aggregation(&indexer.graph, &ctx, &TsBarrelAggregator::new())
+    // Inline the body of `apply_aggregation` so we can keep the mapping:
+    // the public helper throws it away after rewriting edges. Rebuilding
+    // it here avoids touching the existing API.
+    let raw_nodes: Vec<aggregation::RawNode> = indexer
+        .graph
+        .nodes
+        .values()
+        .cloned()
+        .map(aggregation::RawNode::from)
+        .collect();
+    let result = if indexer.options.collapse_barrels {
+        <TsBarrelAggregator as aggregation::NodeAggregator>::aggregate(
+            &TsBarrelAggregator::new(),
+            &raw_nodes,
+            &ctx,
+        )
     } else {
-        aggregation::apply_aggregation(&indexer.graph, &ctx, &PassthroughAggregator::new())
+        <PassthroughAggregator as aggregation::NodeAggregator>::aggregate(
+            &PassthroughAggregator::new(),
+            &raw_nodes,
+            &ctx,
+        )
+    };
+
+    let mut g = Graph::new();
+    for n in &result.nodes {
+        g.add_node(n.clone());
     }
+    for edge in aggregation::rewrite_edges(&indexer.graph.edges, &result.mapping) {
+        g.add_edge(&edge.from, &edge.to);
+    }
+    let members = BarrelMembers::from_mapping(&result.mapping);
+    (g, members)
 }
 
 /// Append `src` into `dst`, preserving ordering (removals first, additions
@@ -1697,7 +1789,7 @@ mod tests {
 
         let indexer = crate::indexer::Indexer::build(dir.path());
         assert!(indexer.options.collapse_barrels, "default must be true");
-        let g = aggregated_graph(&indexer);
+        let g = aggregated_graph_and_members(&indexer).0;
 
         // Exactly one barrel node, no separate src/index or src/util nodes.
         let barrel_count = g.nodes.values().filter(|n| n.id.starts_with("barrel:")).count();
@@ -1895,6 +1987,107 @@ mod tests {
     }
 
     #[test]
+    fn recomputing_cone_populates_cache_with_transitive_dependents() {
+        // Direct drive of the cone-cache computation: selecting `c` in a
+        // linear a->b->c chain yields cone {a, b} (the upstream importers)
+        // and excludes `c` itself per the reachability rule.
+        let mut g = Graph::new();
+        for id in ["a", "b", "c"] {
+            g.add_node(file_node(id));
+        }
+        g.add_edge("a", "b");
+        g.add_edge("b", "c");
+        let mut app = app_with_graph(g);
+
+        app.selected = Some("c".to_string());
+        app.recompute_blast_cone();
+        let cone = app
+            .blast_cone
+            .as_ref()
+            .expect("cone must be populated on selection");
+        let expected: std::collections::HashSet<NodeId> =
+            ["a", "b"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(cone, &expected);
+    }
+
+    #[test]
+    fn escape_clears_blast_cone_cache() {
+        // Dismissing drops the cache so the next paint has nothing to dim
+        // against. Prevents a stale cone from lingering after the user said
+        // "I'm done looking at this node."
+        let mut g = Graph::new();
+        for id in ["a", "b", "c"] {
+            g.add_node(file_node(id));
+        }
+        g.add_edge("a", "b");
+        g.add_edge("b", "c");
+        let mut app = app_with_graph(g);
+
+        app.selected = Some("c".to_string());
+        app.recompute_blast_cone();
+        assert!(app.blast_cone.is_some(), "precondition: cone is cached");
+
+        app.dispatch_shortcut(ShortcutAction::Dismiss);
+        assert!(app.selected.is_none());
+        assert!(
+            app.blast_cone.is_none(),
+            "Escape must clear the cone cache alongside the selection"
+        );
+    }
+
+    #[test]
+    fn blast_radius_summary_reports_files_and_packages() {
+        // Status-bar readout regression: the "N files in M packages depend
+        // on this." string is derived from `cone_stats` against the cached
+        // cone. Covers the isolated-node case (0, 0) and a non-empty cone
+        // that spans two packages.
+        let mut g = Graph::new();
+        g.add_node(Node {
+            id: "a".into(),
+            path: PathBuf::from("a"),
+            label: "a".into(),
+            package: Some("pkg-a".into()),
+            kind: NodeKind::File,
+        });
+        g.add_node(Node {
+            id: "b".into(),
+            path: PathBuf::from("b"),
+            label: "b".into(),
+            package: Some("pkg-b".into()),
+            kind: NodeKind::File,
+        });
+        g.add_node(Node {
+            id: "target".into(),
+            path: PathBuf::from("target"),
+            label: "target".into(),
+            package: Some("pkg-t".into()),
+            kind: NodeKind::File,
+        });
+        g.add_edge("a", "target");
+        g.add_edge("b", "target");
+        let mut app = app_with_graph(g);
+
+        // No selection → no summary.
+        assert!(app.blast_radius_summary().is_none());
+
+        // Select `target`: cone is {a, b}. Status reads "2 files in 2
+        // packages depend on this."
+        app.selected = Some("target".to_string());
+        app.recompute_blast_cone();
+        let summary = app
+            .blast_radius_summary()
+            .expect("summary must be populated for a live selection");
+        assert_eq!(summary, "2 files in 2 packages depend on this.");
+
+        // Isolated-node selection → (0, 0) → "0 files in 0 packages depend
+        // on this." — the PRD's explicit lower-bound format.
+        app.selected = Some("a".to_string());
+        app.recompute_blast_cone();
+        let summary = app.blast_radius_summary().unwrap();
+        assert_eq!(summary, "0 files in 0 packages depend on this.");
+    }
+
+    #[test]
     fn collapse_barrels_off_keeps_src_files_separate() {
         // Same fixture, flag flipped: src/ stays expanded, bar.ts →
         // src/util.ts is the literal file-level edge madge would produce.
@@ -1903,7 +2096,7 @@ mod tests {
 
         let mut indexer = crate::indexer::Indexer::build(dir.path());
         indexer.options.collapse_barrels = false;
-        let g = aggregated_graph(&indexer);
+        let g = aggregated_graph_and_members(&indexer).0;
 
         // No barrel nodes — every src/* file shows up as itself.
         assert!(

@@ -289,9 +289,11 @@ impl GruffApp {
                     // was scoped to the previous selection — re-clicking
                     // re-arms without the user having to press `B` again.
                     self.blast_radius_active = true;
+                    self.recompute_blast_cone();
                 } else {
                     self.selected = None;
                     self.highlight = None;
+                    self.blast_cone = None;
                 }
             }
         }
@@ -332,6 +334,16 @@ impl GruffApp {
             .as_ref()
             .filter(|s| !s.input.trim().is_empty())
             .map(|s| &s.matches);
+        // Blast-radius cone: when active, non-dependents are dimmed. Only
+        // consulted when a selection is live AND `blast_radius_active` is on
+        // (the `B` keybind flips the flag without deselecting, so the cone
+        // cache stays populated but the render path skips it). `None` here
+        // short-circuits the per-element check exactly like `search_matches`
+        // above.
+        let cone: Option<&HashSet<NodeId>> = self
+            .blast_cone
+            .as_ref()
+            .filter(|_| self.blast_radius_active && self.selected.is_some());
 
         // Precompute each visible node's screen-space half-extents so the
         // edge loop can trim lines and anchor arrowheads at the same AABB
@@ -388,9 +400,19 @@ impl GruffApp {
                 let to_lit = m.contains(&edge.to) || self.selected.as_ref() == Some(&edge.to);
                 !(from_lit && to_lit)
             });
+            // Blast-radius dim parallels the search-dim rule: an edge stays
+            // lit only when both endpoints are either in the cone or the
+            // selected node itself. A node-in-cone / node-out-of-cone edge
+            // would visually anchor to a dim node and read as a loose
+            // thread.
+            let cone_dim = cone.is_some_and(|c| {
+                let from_lit = c.contains(&edge.from) || self.selected.as_ref() == Some(&edge.from);
+                let to_lit = c.contains(&edge.to) || self.selected.as_ref() == Some(&edge.to);
+                !(from_lit && to_lit)
+            });
             let (width, color) = if on_path {
                 (2.0, base)
-            } else if highlight_active || search_dim {
+            } else if highlight_active || search_dim || cone_dim {
                 (1.0, base.gamma_multiply(DIM_ALPHA))
             } else if is_cycle {
                 (1.6, base)
@@ -457,7 +479,14 @@ impl GruffApp {
             // always see which file they had focused.
             let dim_by_highlight = highlight_active && !on_path && !is_selected;
             let dim_by_search = search_matches.is_some_and(|m| !m.contains(id) && !is_selected);
-            let color = if dim_by_highlight || dim_by_search {
+            // Blast-radius dim: nodes outside the cone are dim. Selected
+            // stays lit always (it's the subject of the cone); barrel-member
+            // raw ids present in the cone also count as "in cone" even if
+            // they aren't rendered — see the edge rule above. Rendered
+            // display nodes not in the cone get dimmed.
+            let dim_by_cone =
+                cone.is_some_and(|c| !c.contains(id) && !is_selected);
+            let color = if dim_by_highlight || dim_by_search || dim_by_cone {
                 base.gamma_multiply(DIM_ALPHA)
             } else {
                 base
@@ -491,7 +520,7 @@ impl GruffApp {
                     // Text color: foreground that reads on the dim/fill alpha
                     // combination. Dim nodes get a dim label too so the pair
                     // reads as a unit.
-                    let text_color = if dim_by_highlight || dim_by_search {
+                    let text_color = if dim_by_highlight || dim_by_search || dim_by_cone {
                         colors::HINT.gamma_multiply(DIM_ALPHA * 2.0)
                     } else {
                         egui::Color32::from_rgb(0xF4, 0xF6, 0xF8)
