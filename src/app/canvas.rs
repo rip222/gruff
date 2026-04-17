@@ -10,11 +10,6 @@ use crate::node_label;
 
 use super::{FitMode, GruffApp};
 
-/// Click tolerance for edge hit-testing, in screen pixels. Set wider than the
-/// edge stroke width so clicks near a thin 1 px line still land — trackpads
-/// and mice jitter a few pixels per click.
-const EDGE_HIT_PX: f32 = 6.0;
-
 /// World-space margin around a fit's bounding box. Additive (not
 /// multiplicative) so a single-node or self-loop bbox still gets visible
 /// breathing room instead of collapsing to zero padding.
@@ -167,43 +162,6 @@ impl GruffApp {
         Vec2::new(width, height)
     }
 
-    /// Find the edge whose on-screen line segment is closest to `screen_pos`,
-    /// within a pixel-distance tolerance. Returns `None` if nothing is close
-    /// enough. Works purely in screen space so the hit tolerance is a fixed
-    /// pixel distance regardless of zoom.
-    fn pick_edge(
-        &self,
-        screen_pos: egui::Pos2,
-        screen_center: egui::Pos2,
-    ) -> Option<(NodeId, NodeId)> {
-        let mut best: Option<(f32, (NodeId, NodeId))> = None;
-        for edge in &self.graph.edges {
-            // Edges with a hidden endpoint are out of the visible subgraph
-            // entirely — skip them in hit-testing so a stray click near a
-            // phantom line doesn't select something that isn't drawn.
-            // `layout.get` also returns `None` for hidden nodes (they were
-            // removed by `resync_layout`), which is already enough to skip,
-            // but being explicit matches the render loop below.
-            if self.filter_state.is_hidden(&edge.from) || self.filter_state.is_hidden(&edge.to) {
-                continue;
-            }
-            let (Some(pa), Some(pb)) = (self.layout.get(&edge.from), self.layout.get(&edge.to))
-            else {
-                continue;
-            };
-            let a = self.world_to_screen(pa, screen_center);
-            let b = self.world_to_screen(pb, screen_center);
-            let d = point_to_segment_distance(screen_pos, a, b);
-            if d <= EDGE_HIT_PX {
-                match &best {
-                    Some((bd, _)) if *bd <= d => {}
-                    _ => best = Some((d, (edge.from.clone(), edge.to.clone()))),
-                }
-            }
-        }
-        best.map(|(_, e)| e)
-    }
-
     /// Find the topmost node at `screen_pos` whose drawn rect covers it.
     /// Hit-test is rect-based to match the new rounded-rect node shape.
     /// Ties (two overlapping rects both contain the point) resolve by
@@ -315,21 +273,16 @@ impl GruffApp {
             self.disable_auto_refit_on_user_interaction();
         }
 
-        // Click handling: nodes take priority over edges (the hit radius is
-        // tighter than the edge tolerance, and the user almost always meant
-        // the node when both are under the cursor). A node click selects
-        // the node and highlights its direct neighbours in both directions
-        // — one hop, no transitive walk. An edge click keeps the existing
-        // path-through-the-edge behavior. An empty-canvas click clears both
-        // the selection and any active highlight.
+        // Click handling: a node click selects the node and highlights its
+        // direct neighbours in both directions — one hop, no transitive
+        // walk. Anything else (empty canvas, an edge) clears both the
+        // selection and any active highlight: edges are no longer pick
+        // targets per #29.
         if response.clicked() {
             if let Some(click_pos) = response.interact_pointer_pos() {
                 if let Some(node) = self.pick_node(click_pos, center, ui) {
                     self.highlight = Some(self.build_one_hop_highlight(&node));
                     self.selected = Some(node);
-                } else if let Some((from, to)) = self.pick_edge(click_pos, center) {
-                    self.highlight = Some(self.build_path_highlight(&from, &to));
-                    self.selected = None;
                 } else {
                     self.selected = None;
                     self.highlight = None;
@@ -350,13 +303,10 @@ impl GruffApp {
                 self.disable_auto_refit_on_user_interaction();
             }
 
-            // Pointer-hand cursor over nodes and edges signals clickability
-            // — essential feedback now that edges are click targets too.
-            // Node check first so a node under the cursor wins regardless of
-            // whether an edge also passes nearby.
-            if self.pick_node(hover, center, ui).is_some()
-                || self.pick_edge(hover, center).is_some()
-            {
+            // Pointer-hand cursor over nodes signals clickability. Edges
+            // aren't pick targets after #29, so they don't get the cursor
+            // change — the cursor stays the default arrow over them.
+            if self.pick_node(hover, center, ui).is_some() {
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             }
         }
@@ -653,55 +603,3 @@ fn draw_arrowhead(
     ));
 }
 
-/// Shortest distance from a point to a line segment in 2D (screen space).
-/// Used by edge hit-testing so clicking near an edge — not just exactly on
-/// its 1 px stroke — still selects it.
-fn point_to_segment_distance(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
-    let abx = b.x - a.x;
-    let aby = b.y - a.y;
-    let len_sq = abx * abx + aby * aby;
-    if len_sq < f32::EPSILON {
-        // Degenerate segment (a == b): fall back to point-to-point distance.
-        let dx = p.x - a.x;
-        let dy = p.y - a.y;
-        return (dx * dx + dy * dy).sqrt();
-    }
-    let apx = p.x - a.x;
-    let apy = p.y - a.y;
-    // Clamp to [0, 1] so we only measure against the segment, not the
-    // infinite line it sits on — near-colinear clicks past the endpoints
-    // correctly measure to the endpoint.
-    let t = ((apx * abx + apy * aby) / len_sq).clamp(0.0, 1.0);
-    let projx = a.x + t * abx;
-    let projy = a.y + t * aby;
-    let dx = p.x - projx;
-    let dy = p.y - projy;
-    (dx * dx + dy * dy).sqrt()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn point_to_segment_distance_clamps_to_endpoints() {
-        let a = egui::pos2(0.0, 0.0);
-        let b = egui::pos2(10.0, 0.0);
-
-        // Midpoint perpendicular.
-        let d_mid = point_to_segment_distance(egui::pos2(5.0, 3.0), a, b);
-        assert!((d_mid - 3.0).abs() < 0.001);
-
-        // Past the endpoint — must measure to the endpoint, not the line.
-        let d_past = point_to_segment_distance(egui::pos2(20.0, 0.0), a, b);
-        assert!((d_past - 10.0).abs() < 0.001);
-
-        // On the segment — zero distance.
-        let d_on = point_to_segment_distance(egui::pos2(5.0, 0.0), a, b);
-        assert!(d_on < 0.001);
-
-        // Degenerate zero-length segment falls back to point distance.
-        let d_degen = point_to_segment_distance(egui::pos2(3.0, 4.0), a, a);
-        assert!((d_degen - 5.0).abs() < 0.001);
-    }
-}
