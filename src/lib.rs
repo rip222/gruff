@@ -16,6 +16,7 @@ pub mod lib_detect;
 pub mod node_label;
 pub mod package_tree;
 pub mod parser;
+pub mod recents;
 pub mod resolver;
 pub mod search;
 pub mod watcher;
