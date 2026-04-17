@@ -12,6 +12,7 @@ pub mod export;
 pub mod filter_state;
 pub mod filters;
 pub mod graph;
+pub mod hotspot_scorer;
 pub mod indexer;
 pub mod layout;
 pub mod lib_detect;
