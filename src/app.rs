@@ -228,6 +228,28 @@ impl GruffApp {
         app
     }
 
+    /// Build a fresh app and open `path` directly, bypassing the `last_repo`
+    /// read entirely. Used by the CLI path-arg flow so `gruff <path>` always
+    /// opens what the user asked for — even if `last_repo` points somewhere
+    /// else. A successful `load_folder` still writes `last_repo` so the next
+    /// bare `gruff` resumes the CLI-opened repo, matching today's behavior.
+    pub fn with_path(path: PathBuf) -> Self {
+        let mut app = Self::default();
+        app.load_folder(path);
+        app
+    }
+
+    /// Build a fresh app in the onboarding state with a pre-seeded status-bar
+    /// message. Used by the CLI flow when the user passed an invalid path:
+    /// rather than silently autoloading `last_repo`, we land on the empty
+    /// canvas with the error visible so the behavior matches what was typed.
+    pub fn with_error_state(msg: impl Into<String>) -> Self {
+        Self {
+            status: msg.into(),
+            ..Self::default()
+        }
+    }
+
     fn load_folder(&mut self, path: PathBuf) {
         let start = Instant::now();
         let mut indexer = Indexer::build(&path);
@@ -1072,6 +1094,66 @@ mod tests {
         // place that arms it, based on post-settle velocity.
         let app = GruffApp::default();
         assert!(!app.auto_refit);
+    }
+
+    // --- CLI constructors (#31) -------------------------------------------
+
+    #[test]
+    fn with_error_state_seeds_status_bar_and_leaves_graph_empty() {
+        // Invalid-path CLI flow: the app lands on the onboarding canvas
+        // with the error quoted in the status bar. No graph, no indexer,
+        // no watcher — bit-identical to a first-launch empty state apart
+        // from the pre-seeded status message.
+        let app = GruffApp::with_error_state("could not open /nope: not found");
+        assert_eq!(app.status, "could not open /nope: not found");
+        assert!(app.graph.nodes.is_empty());
+        assert!(app.graph.edges.is_empty());
+        assert!(app.indexer.is_none());
+        assert!(app.watcher.is_none());
+        assert!(app.last_root.is_none());
+    }
+
+    #[test]
+    fn with_path_loads_graph_and_updates_last_repo() {
+        // Valid-path CLI flow: `with_path` behaves like today's autoload
+        // but starts from the passed directory directly. Assert the graph
+        // actually built and that `last_repo` was bumped to the new root so
+        // the next bare `gruff` resumes there.
+        //
+        // The tempdir doubles as $HOME so `config::save` inside
+        // `load_folder` writes to a throwaway ~/.gruff rather than the
+        // real user config. `set_var` is process-global; guarded with
+        // `unsafe` per the Rust 2024 edition contract and kept to this
+        // single app-level test to avoid stepping on concurrent tests.
+        let home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("a.ts"), r#"import { b } from "./b";"#).unwrap();
+        std::fs::write(repo.path().join("b.ts"), "export const b = 1;").unwrap();
+
+        let app = GruffApp::with_path(repo.path().to_path_buf());
+
+        assert!(
+            !app.graph.nodes.is_empty(),
+            "with_path must index the passed folder, got empty graph"
+        );
+        assert!(app.indexer.is_some(), "indexer should be installed");
+        assert_eq!(
+            app.last_root.as_deref(),
+            Some(app.indexer.as_ref().unwrap().ws.root.as_path()),
+            "last_root should point at the workspace root"
+        );
+        // `last_repo` is the persisted surface — canonicalization happens
+        // inside `Indexer::build`, so compare against `ws.root` rather than
+        // the raw tempdir path.
+        assert_eq!(
+            app.config.last_repo.as_deref(),
+            Some(app.indexer.as_ref().unwrap().ws.root.as_path()),
+            "last_repo must be updated to the opened folder"
+        );
     }
 
     // --- Filter plumbing (#22) --------------------------------------------
