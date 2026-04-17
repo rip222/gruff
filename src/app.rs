@@ -15,6 +15,7 @@ use crate::graph::{Graph, GraphDiff, NodeId};
 use crate::indexer::Indexer;
 use crate::layout::Layout;
 use crate::lib_detect::{self, LibDetector, TsLibDetector};
+use crate::shortcuts::{self, KeyPress, ShortcutAction, ShortcutMods};
 use crate::watcher::{ChangeEvent, Watcher};
 
 mod canvas;
@@ -703,6 +704,70 @@ impl GruffApp {
         self.auto_refit = false;
     }
 
+    /// Perform the side effects mapped to `action` by the shortcuts registry.
+    /// Called by the frame loop once per matched key press. Per-action gates
+    /// (overlay guards, "graph non-empty", etc.) live here so the registry
+    /// stays purely declarative — the table is `(keys, label, group, action)`
+    /// and this function is the only place `ShortcutAction` variants fan out
+    /// into app state.
+    fn dispatch_shortcut(&mut self, action: ShortcutAction) {
+        match action {
+            ShortcutAction::OpenFolder => {
+                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    self.load_folder(dir);
+                }
+            }
+            ShortcutAction::ToggleSearch => {
+                // Gate on a non-empty graph so the shortcut doesn't surface
+                // an empty overlay on the onboarding screen.
+                if !self.graph.nodes.is_empty() {
+                    self.toggle_search();
+                }
+            }
+            ShortcutAction::Rescan => {
+                if self.last_root.is_some() {
+                    self.rescan_folder();
+                }
+            }
+            ShortcutAction::TogglePhysics => {
+                // Don't pause physics from a space typed into the search box.
+                if self.search.is_none() {
+                    self.sim_enabled = !self.sim_enabled;
+                }
+            }
+            ShortcutAction::FitView => {
+                // Bare `F` is only meaningful on the main canvas — overlays
+                // handle text input and would otherwise eat the keystroke.
+                if self.search.is_none()
+                    && self.editor_prompt.is_none()
+                    && !self.layout.is_empty()
+                {
+                    self.fit_request = Some(FitMode::Tween);
+                }
+            }
+            ShortcutAction::Dismiss => {
+                // Unwind overlay state layer by layer: editor prompt →
+                // search overlay → selection/highlight. Each press handles
+                // exactly one layer so the user can back out gradually.
+                if self.editor_prompt.is_some() {
+                    self.editor_prompt = None;
+                } else if self.search.is_some() {
+                    // Closing the overlay clears the dim state per the
+                    // search issue's acceptance criteria — the search
+                    // struct owns both.
+                    self.search = None;
+                } else {
+                    self.selected = None;
+                    self.highlight = None;
+                }
+            }
+            ShortcutAction::Noop => {
+                // Placeholder entries (`B` pending issue #35, `?` wired in
+                // commit 4 of PRD #33). Fall through intentionally.
+            }
+        }
+    }
+
     fn current_status_errors(&self) -> Vec<GruffError> {
         let mut errors = self
             .indexer
@@ -901,6 +966,47 @@ fn is_readable_dir(path: &std::path::Path) -> bool {
     std::fs::read_dir(path).is_ok()
 }
 
+/// Lift each key press in the current frame's input queue into the
+/// registry-facing `KeyPress` shape. Only keys the registry knows how to
+/// label come through — anything else is dropped silently so stray text
+/// entry doesn't bounce against the dispatcher. Extracted so the shortcut
+/// loop in `ui()` stays a flat `for press in presses { for shortcut ... }`.
+fn collect_key_presses(ctx: &egui::Context) -> Vec<KeyPress> {
+    ctx.input(|i| {
+        let mods = ShortcutMods {
+            command: i.modifiers.command,
+            ctrl: i.modifiers.ctrl,
+            alt: i.modifiers.alt,
+            shift: i.modifiers.shift,
+        };
+        let mut out = Vec::new();
+        // `events` carries the per-frame stream; filtering to `Key::Pressed`
+        // matches the old `key_pressed` calls exactly. We map to the same
+        // `&'static str` tokens `parse_keys` produces so the two sides agree
+        // without a shared intermediate.
+        for event in &i.events {
+            if let egui::Event::Key {
+                key, pressed: true, ..
+            } = event
+            {
+                let token = match key {
+                    egui::Key::O => "O",
+                    egui::Key::F => "F",
+                    egui::Key::R => "R",
+                    egui::Key::B => "B",
+                    egui::Key::Space => "SPACE",
+                    egui::Key::Escape => "ESC",
+                    egui::Key::Questionmark => "?",
+                    egui::Key::Slash => "/",
+                    _ => continue,
+                };
+                out.push(KeyPress { key: token, mods });
+            }
+        }
+        out
+    })
+}
+
 /// Build the menu label for a recent folder: the folder's own name with
 /// the parent directory in parentheses when available, so two sibling
 /// repos named `app` can be distinguished at a glance. Falls back to the
@@ -956,29 +1062,21 @@ impl eframe::App for GruffApp {
         let ctx = ui.ctx().clone();
         self.poll_runtime_errors();
 
-        // Cmd+O (or Ctrl+O on non-mac via `modifiers.command`).
-        let open_requested = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O));
-        if open_requested {
-            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                self.load_folder(dir);
+        // Single pass over every pressed key this frame: iterate the
+        // shortcuts registry, let each entry decide whether it matches, and
+        // dispatch on the typed `ShortcutAction`. Per-action gates (overlay
+        // guards, "graph non-empty", etc.) live inside `dispatch_shortcut`
+        // so the registry stays purely declarative.
+        let presses = collect_key_presses(&ctx);
+        for press in presses {
+            for shortcut in shortcuts::SHORTCUTS {
+                if shortcut.matches(&press) {
+                    self.dispatch_shortcut(shortcut.action);
+                    // First-match wins; `keys` uniqueness (enforced by the
+                    // registry's unit test) makes this deterministic.
+                    break;
+                }
             }
-        }
-
-        // Cmd+F opens (or closes) the fuzzy-search overlay. We gate it on
-        // having a loaded graph so the shortcut doesn't surface a useless
-        // empty overlay on the initial onboarding screen.
-        let search_requested = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F));
-        if search_requested && !self.graph.nodes.is_empty() {
-            self.toggle_search();
-        }
-
-        // Cmd+R forces a full re-scan of the currently-loaded folder.
-        // Watcher events patch the graph incrementally; Cmd+R is the
-        // recovery path that reconciles any drift (files moved while the
-        // watcher was paused, rename storms we missed, etc.).
-        let refresh_requested = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::R));
-        if refresh_requested && self.last_root.is_some() {
-            self.rescan_folder();
         }
 
         // Drain and apply any filesystem changes since the previous frame.
@@ -990,46 +1088,6 @@ impl eframe::App for GruffApp {
             // The watcher and panic queue are polled from the UI thread.
             // Keep a light heartbeat even when physics is paused.
             ctx.request_repaint_after(Duration::from_millis(100));
-        }
-
-        // Space toggles the physics simulation (useful when it settles).
-        // Skip while the search overlay is open so typing a space in the
-        // search box doesn't pause physics.
-        if self.search.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Space)) {
-            self.sim_enabled = !self.sim_enabled;
-        }
-
-        // Bare `F` refits the viewport to the currently-visible graph.
-        // Gated on no overlays being open so typing `f` in the search box
-        // doesn't pull the rug out. The `!command && !ctrl` guards keep
-        // this shortcut from swallowing Cmd+F (search) or Ctrl+F.
-        let fit_requested = self.search.is_none()
-            && self.editor_prompt.is_none()
-            && ctx.input(|i| {
-                !i.modifiers.command
-                    && !i.modifiers.ctrl
-                    && !i.modifiers.alt
-                    && i.key_pressed(egui::Key::F)
-            });
-        if fit_requested && !self.layout.is_empty() {
-            self.fit_request = Some(FitMode::Tween);
-        }
-
-        // Escape deselects, or dismisses whichever overlay is open. Priority:
-        // editor prompt → search overlay → clear selection/highlight. Each
-        // stage handles exactly one pressed Escape so the user can unwind
-        // state layer by layer.
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.editor_prompt.is_some() {
-                self.editor_prompt = None;
-            } else if self.search.is_some() {
-                // Closing the overlay clears the dim state per the issue's
-                // acceptance criteria — the search struct owns both.
-                self.search = None;
-            } else {
-                self.selected = None;
-                self.highlight = None;
-            }
         }
 
         egui::Panel::top("menu_bar").show_inside(ui, |ui| {
@@ -1534,6 +1592,87 @@ mod tests {
         assert_eq!(
             bar_to_barrel, 1,
             "expected one rewritten edge from bar.ts to the barrel"
+        );
+    }
+
+    // --- shortcut dispatch (#33) ------------------------------------------
+
+    use crate::shortcuts::ShortcutGroup;
+
+    #[test]
+    fn navigation_dispatch_routes_escape_to_clear_selection() {
+        // Navigation-group regression: Escape takes the "clear selection"
+        // branch when no overlays are open. Exercised via the public
+        // dispatcher so the test doesn't need an egui context.
+        let mut app = app_with_graph(abc_cycle_graph());
+        app.selected = Some("a".to_string());
+        app.dispatch_shortcut(ShortcutAction::Dismiss);
+        assert!(
+            app.selected.is_none(),
+            "Dismiss with no overlay open must clear selection"
+        );
+        // Sanity: the registry still wires Escape to Dismiss — the refactor
+        // would be silently broken if the entry had drifted off the action.
+        let esc_entry = shortcuts::SHORTCUTS
+            .iter()
+            .find(|s| s.keys.eq_ignore_ascii_case("esc"))
+            .expect("Escape must appear in the registry");
+        assert_eq!(esc_entry.group, ShortcutGroup::Navigation);
+        assert_eq!(esc_entry.action, ShortcutAction::Dismiss);
+    }
+
+    #[test]
+    fn view_dispatch_toggles_physics() {
+        // View-group regression: Space flips `sim_enabled`. Guarded on
+        // `search.is_none()` which `app_with_graph` satisfies by default.
+        let mut app = app_with_graph(abc_cycle_graph());
+        let before = app.sim_enabled;
+        app.dispatch_shortcut(ShortcutAction::TogglePhysics);
+        assert_ne!(
+            app.sim_enabled, before,
+            "TogglePhysics must flip the sim_enabled flag"
+        );
+        let space_entry = shortcuts::SHORTCUTS
+            .iter()
+            .find(|s| s.keys == "Space")
+            .expect("Space must appear in the registry");
+        assert_eq!(space_entry.group, ShortcutGroup::View);
+        assert_eq!(space_entry.action, ShortcutAction::TogglePhysics);
+    }
+
+    #[test]
+    fn filters_group_has_display_entry() {
+        // The Filters group has no keyboard dispatch today — the file-
+        // visibility toggles live in the sidebar — but the registry still
+        // must surface a documentation row so the help modal's Filters
+        // section isn't empty.
+        let has_filter = shortcuts::SHORTCUTS
+            .iter()
+            .any(|s| s.group == ShortcutGroup::Filters);
+        assert!(
+            has_filter,
+            "Filters group must have at least one registry entry for the help modal"
+        );
+    }
+
+    #[test]
+    fn help_dispatch_is_noop_pre_wiring() {
+        // Help-group regression: the `?` placeholder is registered but
+        // deliberately unwired until commit 4 of PRD #33. Dispatching the
+        // `?` action via its `Noop` variant must be a safe no-op.
+        let mut app = app_with_graph(abc_cycle_graph());
+        let before = (app.sim_enabled, app.selected.clone(), app.fit_request);
+        app.dispatch_shortcut(ShortcutAction::Noop);
+        let after = (app.sim_enabled, app.selected.clone(), app.fit_request);
+        assert_eq!(before, after, "Noop action must not mutate app state");
+        let help_entry = shortcuts::SHORTCUTS
+            .iter()
+            .find(|s| s.group == ShortcutGroup::Help)
+            .expect("Help group must have an entry");
+        assert_eq!(
+            help_entry.action,
+            ShortcutAction::Noop,
+            "Help entry is the `?` placeholder until commit 4 wires it"
         );
     }
 
