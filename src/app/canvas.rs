@@ -523,6 +523,28 @@ impl GruffApp {
             let corner_px = (RECT_CORNER_RADIUS * zoom).clamp(1.0, 10.0);
             painter.rect_filled(rect, corner_px, color);
 
+            // Dashed border on dead-code orphans (#36). A node flagged by
+            // either orphan sub-set (unreachable-from-entries OR
+            // no-incoming-imports) gets a dashed outline; fill, selection
+            // ring, and dim rules are all untouched. The PRD calls out
+            // "border-pattern only — color stays the same," so we use the
+            // node's base (pre-dim) color for the dash so the dashed
+            // border reads as a stylistic variant of the same node rather
+            // than a new color signal. Rendered as four edge segments so
+            // the dash pattern wraps each corner cleanly; on extreme
+            // zoom-out the pattern collapses to "faint outline" which is
+            // still a reasonable visual cue.
+            let is_orphan = self.orphan_sets.unreachable_from_entries.contains(id)
+                || self.orphan_sets.no_incoming_imports.contains(id);
+            if is_orphan {
+                let dash_color = if dim_by_highlight || dim_by_search || dim_by_cone {
+                    base.gamma_multiply(DIM_ALPHA)
+                } else {
+                    base
+                };
+                draw_dashed_rect_border(&painter, rect, dash_color);
+            }
+
             if is_selected {
                 // Outer ring makes the selection pop even at low zoom.
                 let ring_rect = rect.expand(3.0);
@@ -626,6 +648,50 @@ fn clip_ray_from_center(
     };
     let t = tx.min(ty);
     Some(egui::pos2(center.x + dx * t, center.y + dy * t))
+}
+
+/// Dash segment length in screen pixels for the orphan-node border.
+/// Short enough to read as "dashed" even on small rects at default zoom.
+const ORPHAN_DASH_LEN_PX: f32 = 4.0;
+
+/// Gap length in screen pixels between orphan-border dashes. Equal to the
+/// dash so the dashed pattern is visually 50/50.
+const ORPHAN_DASH_GAP_PX: f32 = 4.0;
+
+/// Stroke width for the orphan-node dashed border. Picked to read at a
+/// glance without over-advertising — this is secondary styling, not a
+/// primary cycle-edge-style signal.
+const ORPHAN_DASH_STROKE_PX: f32 = 1.2;
+
+/// Draw a dashed axis-aligned rectangular outline around `rect` in `color`.
+/// Used by the orphan-node render path: the node fill still draws first,
+/// then this paints four dashed segments (top, right, bottom, left) that
+/// trace the rect's edges. Each segment is split into dashes by
+/// [`egui::epaint::Shape::dashed_line`] so the caller doesn't have to
+/// maintain per-edge dash phase.
+fn draw_dashed_rect_border(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let stroke = egui::Stroke::new(ORPHAN_DASH_STROKE_PX, color);
+    let corners = [
+        egui::pos2(rect.min.x, rect.min.y),
+        egui::pos2(rect.max.x, rect.min.y),
+        egui::pos2(rect.max.x, rect.max.y),
+        egui::pos2(rect.min.x, rect.max.y),
+    ];
+    // Four edges: top-left → top-right → bottom-right → bottom-left →
+    // top-left. Each pair of corners is one dashed segment; calling
+    // `dashed_line` per edge keeps the dash phase per-edge, which reads
+    // more regular than a single wrapped polyline would at the corners.
+    for i in 0..4 {
+        let shapes = egui::epaint::Shape::dashed_line(
+            &[corners[i], corners[(i + 1) % 4]],
+            stroke,
+            ORPHAN_DASH_LEN_PX,
+            ORPHAN_DASH_GAP_PX,
+        );
+        for shape in shapes {
+            painter.add(shape);
+        }
+    }
 }
 
 /// Draw a filled arrowhead triangle with its tip anchored at `tip` and its
