@@ -17,6 +17,7 @@
 
 use std::collections::{HashSet, VecDeque};
 
+use crate::aggregation::BarrelMembers;
 use crate::graph::{Graph, NodeId};
 
 /// Every node that transitively reaches `start` via the directed edge set.
@@ -57,6 +58,90 @@ pub fn transitive_dependents(graph: &Graph, start: &NodeId) -> HashSet<NodeId> {
         }
     }
     seen
+}
+
+/// Barrel-aware variant of [`transitive_dependents`]. Behaves identically on
+/// graphs with no barrels, but when the BFS encounters a barrel display node
+/// the member files are pulled into the cone as well — so the returned set
+/// reflects real file-level impact rather than display-node impact.
+///
+/// If `start` is itself a barrel member (raw file id collapsed into a display
+/// node), the walk proceeds *as if* `start` were the barrel display node —
+/// an import of the barrel counts as reaching every member, so the cone
+/// picks up upstream importers that never literally reference `start` in
+/// the aggregated graph. This matches the blast-radius UX decision:
+/// selecting one file inside a barrel reports the downstream impact of any
+/// of the barrel's files changing.
+///
+/// Self-in-cone follows the same rule as the non-barrel variant: `start` (or
+/// its display node) is only present in the result when it's reachable back
+/// through some chain of imports. Isolated starting points yield empty
+/// cones, and the status bar renders "0 files depend on this".
+pub fn transitive_dependents_with_barrels(
+    graph: &Graph,
+    start: &NodeId,
+    barrels: &BarrelMembers,
+) -> HashSet<NodeId> {
+    let mut cone: HashSet<NodeId> = HashSet::new();
+    let mut queue: VecDeque<NodeId> = VecDeque::new();
+
+    // Resolve the walk's seed. Three cases:
+    // 1. `start` is a live node in the aggregated graph → walk from it.
+    // 2. `start` is a raw barrel member (absent from the aggregated graph
+    //    because collapse swallowed it) → walk from the barrel display id.
+    // 3. Neither → empty cone.
+    let seed = if graph.nodes.contains_key(start) {
+        start.clone()
+    } else if let Some(display) = barrels.display_of(start) {
+        display.clone()
+    } else {
+        return cone;
+    };
+
+    // `bfs_visited` is the BFS internal set — everything we've already
+    // processed — while `cone` is the public result set. Keeping them
+    // separate means the seed is visited (so we don't loop forever) without
+    // being added to the cone, matching the non-barrel variant's "self only
+    // enters the cone if a chain loops back" semantics.
+    let mut bfs_visited: HashSet<NodeId> = HashSet::new();
+    bfs_visited.insert(seed.clone());
+    for edge in &graph.edges {
+        if edge.to == seed && bfs_visited.insert(edge.from.clone()) {
+            enqueue_and_expand(&edge.from, &mut cone, &mut queue, barrels);
+        }
+    }
+    while let Some(cur) = queue.pop_front() {
+        for edge in &graph.edges {
+            if edge.to != cur {
+                continue;
+            }
+            if !bfs_visited.insert(edge.from.clone()) {
+                continue;
+            }
+            enqueue_and_expand(&edge.from, &mut cone, &mut queue, barrels);
+        }
+    }
+    cone
+}
+
+/// Record `node` in the cone, queue it for further walk, and — if it's a
+/// barrel display id — add every member file to the cone so the caller's
+/// file-count reflects real impact. Only the display id needs to be
+/// re-walked (members don't have their own edges in the aggregated graph),
+/// so members are added to the cone without being queued.
+fn enqueue_and_expand(
+    node: &NodeId,
+    cone: &mut HashSet<NodeId>,
+    queue: &mut VecDeque<NodeId>,
+    barrels: &BarrelMembers,
+) {
+    cone.insert(node.clone());
+    queue.push_back(node.clone());
+    if let Some(members) = barrels.members_of(node) {
+        for m in members {
+            cone.insert(m.clone());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -192,5 +277,123 @@ mod tests {
 
         let cone = transitive_dependents(&g, &"missing".to_string());
         assert!(cone.is_empty());
+    }
+
+    /// Helper: build a [`BarrelMembers`] handle from a literal
+    /// `"display_id" -> &["member", ...]` table. Keeps the barrel tests
+    /// below readable without reaching for a real aggregation pass.
+    fn barrels_from(pairs: &[(&str, &[&str])]) -> BarrelMembers {
+        let mut mapping: std::collections::HashMap<NodeId, NodeId> =
+            std::collections::HashMap::new();
+        for (display, members) in pairs {
+            for m in *members {
+                mapping.insert(m.to_string(), display.to_string());
+            }
+        }
+        BarrelMembers::from_mapping(&mapping)
+    }
+
+    #[test]
+    fn barrel_aware_cone_from_member_reaches_importer_through_barrel() {
+        // Synthetic setup: barrel B with member files m1 and m2. An outer
+        // file f imports B (in the aggregated graph). The cone from m1 must
+        // include f — f doesn't literally reference m1, but it imports the
+        // barrel which represents m1.
+        //
+        // Aggregated graph contains {B, f} + edge f -> B. m1, m2 are raw
+        // file ids absent from the aggregated graph (they collapsed into B),
+        // but present in the BarrelMembers handle.
+        let mut g = Graph::new();
+        g.add_node(file_node("B"));
+        g.add_node(file_node("f"));
+        g.add_edge("f", "B");
+
+        let barrels = barrels_from(&[("B", &["m1", "m2"])]);
+
+        let cone = transitive_dependents_with_barrels(&g, &"m1".to_string(), &barrels);
+        assert!(
+            cone.contains("f"),
+            "cone from m1 must include the importer through the barrel; got {cone:?}"
+        );
+        // Neither the barrel display nor m1/m2 themselves depend on m1 —
+        // the seed and its siblings stay out of the cone per the
+        // non-cyclic "self not in cone" rule.
+        assert!(
+            !cone.contains("B"),
+            "barrel display must not appear in its own cone (seed is excluded)"
+        );
+    }
+
+    #[test]
+    fn barrel_aware_cone_from_non_barrel_file_matches_plain_walk() {
+        // A non-barrel file's cone must be identical to the plain
+        // `transitive_dependents` result — the barrel expansion only kicks
+        // in when the BFS touches a barrel display node.
+        //
+        //   outer -> lone
+        //
+        // `lone` is a regular file (not a member of any barrel); `outer`
+        // imports it. Cone from `lone` is `{outer}`, same as without the
+        // barrel handle.
+        let mut g = Graph::new();
+        g.add_node(file_node("lone"));
+        g.add_node(file_node("outer"));
+        g.add_edge("outer", "lone");
+
+        // The handle happens to describe an unrelated barrel — its presence
+        // must not contaminate the cone of a non-member file.
+        let barrels = barrels_from(&[("other_barrel", &["other_m1", "other_m2"])]);
+
+        let cone = transitive_dependents_with_barrels(&g, &"lone".to_string(), &barrels);
+        let plain = transitive_dependents(&g, &"lone".to_string());
+        assert_eq!(
+            cone, plain,
+            "barrel-aware cone on a non-member file must equal the plain cone"
+        );
+    }
+
+    #[test]
+    fn barrel_encountered_mid_walk_pulls_in_members() {
+        // Chain where the barrel sits in the middle of the cone path:
+        //
+        //   f -> B -> target
+        //
+        // B has members m1, m2. Cone from `target` reaches f by walking the
+        // reverse edges; when BFS steps onto B, members m1 and m2 must also
+        // land in the cone so the file-count reflects reality.
+        let mut g = Graph::new();
+        g.add_node(file_node("target"));
+        g.add_node(file_node("B"));
+        g.add_node(file_node("f"));
+        g.add_edge("f", "B");
+        g.add_edge("B", "target");
+
+        let barrels = barrels_from(&[("B", &["m1", "m2"])]);
+
+        let cone = transitive_dependents_with_barrels(&g, &"target".to_string(), &barrels);
+        let expected: HashSet<NodeId> = ["B", "m1", "m2", "f"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(cone, expected);
+    }
+
+    #[test]
+    fn empty_barrel_handle_matches_plain_walk() {
+        // With a passthrough/empty BarrelMembers handle the barrel-aware
+        // variant must produce exactly the same set as the non-barrel
+        // entry point — the feature degrades cleanly when barrel collapse
+        // is disabled.
+        let mut g = Graph::new();
+        for id in ["a", "b", "c"] {
+            g.add_node(file_node(id));
+        }
+        g.add_edge("a", "b");
+        g.add_edge("b", "c");
+
+        let plain = transitive_dependents(&g, &"c".to_string());
+        let with_empty =
+            transitive_dependents_with_barrels(&g, &"c".to_string(), &BarrelMembers::empty());
+        assert_eq!(plain, with_empty);
     }
 }

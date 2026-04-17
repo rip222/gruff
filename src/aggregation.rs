@@ -78,6 +78,74 @@ pub struct AggregationResult {
     pub mapping: HashMap<NodeId, NodeId>,
 }
 
+/// Handle exposing "barrel display node -> member file ids" both directions.
+/// Built from an [`AggregationResult::mapping`] and consumed by features that
+/// need to reason about file-level identity through the barrel-collapse —
+/// today, the blast-radius cone in [`crate::reachability`]. Decoupling the
+/// handle from [`AggregationContext`] keeps callers that only need barrel
+/// *detection* (the aggregator itself) free of the per-mapping data, and
+/// means the cone walker can be fed a synthetic members map in unit tests
+/// without standing up a real aggregation pass.
+#[derive(Debug, Default, Clone)]
+pub struct BarrelMembers {
+    /// For each barrel display id, the list of raw file-ids collapsed into it.
+    /// Entries for non-barrel passthrough mappings (`raw_id -> raw_id`) are
+    /// omitted — the map only contains actual barrels.
+    by_display: HashMap<NodeId, Vec<NodeId>>,
+    /// Reverse lookup: for each raw member file, its barrel display id. Lets
+    /// the cone walker cheaply answer "is this id a barrel member?" without
+    /// scanning every value in `by_display`.
+    display_of: HashMap<NodeId, NodeId>,
+}
+
+impl BarrelMembers {
+    /// Build a members handle from an aggregation mapping. Raw ids that map
+    /// to themselves (non-barrel passthroughs) are skipped; every other raw
+    /// id is registered as a member of its display id.
+    pub fn from_mapping(mapping: &HashMap<NodeId, NodeId>) -> Self {
+        let mut by_display: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        let mut display_of: HashMap<NodeId, NodeId> = HashMap::new();
+        for (raw, display) in mapping {
+            if raw == display {
+                continue;
+            }
+            by_display
+                .entry(display.clone())
+                .or_default()
+                .push(raw.clone());
+            display_of.insert(raw.clone(), display.clone());
+        }
+        // Stable iteration order regardless of `HashMap` hash seed — matters
+        // for tests that assert on the members list.
+        for members in by_display.values_mut() {
+            members.sort();
+        }
+        Self {
+            by_display,
+            display_of,
+        }
+    }
+
+    /// Empty handle — used when barrel collapse is disabled (passthrough
+    /// aggregation) so callers don't have to branch on "do we have a handle
+    /// at all". The empty handle expands no nodes and has no members.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Member raw file-ids for a barrel display id, or `None` if `id` isn't
+    /// a known barrel.
+    pub fn members_of(&self, id: &NodeId) -> Option<&[NodeId]> {
+        self.by_display.get(id).map(|v| v.as_slice())
+    }
+
+    /// Barrel display id `id` is a member of, or `None` if `id` isn't a
+    /// member of any barrel.
+    pub fn display_of(&self, id: &NodeId) -> Option<&NodeId> {
+        self.display_of.get(id)
+    }
+}
+
 /// Language-agnostic barrel-collapse contract.
 ///
 /// An implementation inspects the raw node list plus workspace context and
