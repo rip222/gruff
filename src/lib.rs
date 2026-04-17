@@ -1,6 +1,7 @@
 pub mod aggregation;
 pub mod app;
 pub mod camera;
+pub mod cli;
 pub mod colors;
 pub mod config;
 pub mod editor;
