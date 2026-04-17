@@ -22,3 +22,19 @@ pub mod search;
 pub mod shortcuts;
 pub mod watcher;
 pub mod workspace;
+pub mod workspace_state;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    //! Crate-local test helpers shared across modules.
+    //!
+    //! `HOME_GUARD` serialises tests that mutate the process-global `HOME`
+    //! env var. Individual tests holding their own module-local mutex
+    //! would still race against each other because the env var is one
+    //! global; collecting them behind a single crate-wide mutex keeps
+    //! `cargo test` stable regardless of thread count.
+
+    use std::sync::Mutex;
+
+    pub(crate) static HOME_GUARD: Mutex<()> = Mutex::new(());
+}

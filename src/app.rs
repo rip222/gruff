@@ -1259,14 +1259,17 @@ impl eframe::App for GruffApp {
 mod tests {
     use super::*;
 
-    use std::sync::Mutex;
-
     /// Serializes tests that mutate the process-global `HOME` env var. Two
     /// tests simultaneously pointing `$HOME` at different tempdirs races on
     /// `config.toml` reads/writes; the mutex forces them to run one at a
     /// time. `PoisonError` is unwrapped by `into_inner` so one failing test
     /// doesn't cascade-fail every other HOME-mutating test.
-    static HOME_GUARD: Mutex<()> = Mutex::new(());
+    ///
+    /// Lives in [`crate::test_support`] so `workspace_state::tests` and any
+    /// other module that mutates `$HOME` can serialise against the same
+    /// mutex — having two independent guards wouldn't help because the env
+    /// var itself is one global.
+    use crate::test_support::HOME_GUARD;
 
     #[test]
     fn user_interaction_breaks_auto_refit() {
