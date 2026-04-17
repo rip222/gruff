@@ -318,14 +318,14 @@ impl GruffApp {
         // Click handling: nodes take priority over edges (the hit radius is
         // tighter than the edge tolerance, and the user almost always meant
         // the node when both are under the cursor). A node click selects
-        // the node and highlights its recursive upstream ∪ downstream
-        // closure — sibling branches stay dim. An edge click keeps the
-        // existing path-through-the-edge behavior. An empty-canvas click
-        // clears both the selection and any active highlight.
+        // the node and highlights its direct neighbours in both directions
+        // — one hop, no transitive walk. An edge click keeps the existing
+        // path-through-the-edge behavior. An empty-canvas click clears both
+        // the selection and any active highlight.
         if response.clicked() {
             if let Some(click_pos) = response.interact_pointer_pos() {
                 if let Some(node) = self.pick_node(click_pos, center, ui) {
-                    self.highlight = Some(self.build_node_highlight(&node));
+                    self.highlight = Some(self.build_one_hop_highlight(&node));
                     self.selected = Some(node);
                 } else if let Some((from, to)) = self.pick_edge(click_pos, center) {
                     self.highlight = Some(self.build_path_highlight(&from, &to));

@@ -41,6 +41,7 @@ impl GruffApp {
     /// every edge whose endpoints both lie in that union. Sibling branches
     /// — nodes that share a parent with the clicked node but aren't on its
     /// chain — are excluded.
+    #[allow(dead_code)]
     pub(super) fn build_node_highlight(&self, node: &NodeId) -> PathHighlight {
         compute_node_highlight(node, &self.graph.edges, &self.imports, &self.imported_by)
     }
@@ -51,7 +52,6 @@ impl GruffApp {
     /// neighbours. No transitive walk — grandparents and grandchildren stay
     /// dim. The cycle-tinting system handles any cycle visualisation
     /// independently.
-    #[allow(dead_code)]
     pub(super) fn build_one_hop_highlight(&self, node: &NodeId) -> PathHighlight {
         compute_one_hop_highlight(node, &self.imports, &self.imported_by)
     }
