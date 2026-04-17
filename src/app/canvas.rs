@@ -467,6 +467,34 @@ impl GruffApp {
             }
         }
 
+        // Hotspot halo pass (#37). Runs strictly between the edge pass and
+        // the node-rect pass so halos layer over edges but under node
+        // fills. No-op when the overlay is off (`hotspot_data` is `None`);
+        // otherwise every ranked node with normalised score above the floor
+        // gets a warm-toned additive halo whose alpha scales with its
+        // position in the ranking. Hidden nodes are skipped because
+        // `layout.get` returns `None` for them.
+        if let Some(hotspots) = self.hotspot_data.as_ref() {
+            for (id, raw) in &hotspots.ranked {
+                if self.filter_state.is_hidden(id) {
+                    continue;
+                }
+                let Some(pos) = self.layout.get(id) else {
+                    continue;
+                };
+                let p = self.world_to_screen(pos, center);
+                let (half_w_px, half_h_px) = node_half_extents
+                    .get(id)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        let s = self.node_render_size_world(id, ui);
+                        (s.x * zoom * 0.5, s.y * zoom * 0.5)
+                    });
+                let norm = hotspots.normalise(*raw);
+                draw_hotspot_halo(&painter, p, half_w_px, half_h_px, norm);
+            }
+        }
+
         // Labels render in world space — font size scales with zoom — and
         // hide entirely when they'd be sub-readable. The rect itself always
         // draws, so the graph shape stays legible at low zoom.
@@ -650,6 +678,28 @@ fn clip_ray_from_center(
     Some(egui::pos2(center.x + dx * t, center.y + dy * t))
 }
 
+/// Warm-toned halo gradient for the hotspot heatmap (#37). Five concentric
+/// rings, outermost first, approximating a red → orange → yellow →
+/// transparent radial gradient. Egui 0.34 doesn't expose a native radial
+/// gradient, so we additively stack translucent filled circles — the sum
+/// reads as a warm glow behind the node rect. The final entry's alpha is
+/// kept very low so the outer edge fades into the canvas instead of
+/// terminating in a hard circle.
+const HOTSPOT_HALO_RINGS: &[(egui::Color32, f32)] = &[
+    // (color, radius multiplier of node half-extent)
+    (egui::Color32::from_rgba_premultiplied(0xFF, 0x33, 0x1A, 0x0A), 3.2),
+    (egui::Color32::from_rgba_premultiplied(0xFF, 0x66, 0x1F, 0x12), 2.6),
+    (egui::Color32::from_rgba_premultiplied(0xFF, 0x8A, 0x2C, 0x1C), 2.1),
+    (egui::Color32::from_rgba_premultiplied(0xFF, 0xB4, 0x42, 0x2C), 1.6),
+    (egui::Color32::from_rgba_premultiplied(0xFF, 0xD5, 0x66, 0x3C), 1.15),
+];
+
+/// Normalised-score threshold below which the halo is suppressed entirely.
+/// Keeps cold-ish files from getting a faint-but-visible ring — the whole
+/// point of the overlay is to make the hot tail pop, so anything below this
+/// floor is zero ink.
+const HOTSPOT_HALO_MIN_NORM: f32 = 0.05;
+
 /// Dash segment length in screen pixels for the orphan-node border.
 /// Short enough to read as "dashed" even on small rects at default zoom.
 const ORPHAN_DASH_LEN_PX: f32 = 4.0;
@@ -691,6 +741,49 @@ fn draw_dashed_rect_border(painter: &egui::Painter, rect: egui::Rect, color: egu
         for shape in shapes {
             painter.add(shape);
         }
+    }
+}
+
+/// Draw a warm-toned hotspot halo centered on `center` sized by the node's
+/// screen-space half-extent. `norm` is the normalised score in `[0.0, 1.0]`
+/// with 1.0 at the hottest node; alpha of every ring scales with it so the
+/// halo fades smoothly as the ranking falls off. Rings are drawn outer-to-
+/// inner so the inner, more opaque circles layer on top and the gradient
+/// reads brightest at the center.
+///
+/// The base ring radius is the max of the node's half-width / half-height
+/// so non-square rects still sit inside a round halo rather than an
+/// ellipse. No-op below [`HOTSPOT_HALO_MIN_NORM`] so the cold tail doesn't
+/// ink a faint ring on every node.
+fn draw_hotspot_halo(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    half_w_px: f32,
+    half_h_px: f32,
+    norm: f32,
+) {
+    if norm < HOTSPOT_HALO_MIN_NORM {
+        return;
+    }
+    let base_radius = half_w_px.max(half_h_px);
+    if base_radius <= 0.0 {
+        return;
+    }
+    for (color, mult) in HOTSPOT_HALO_RINGS {
+        // Scale the ring alpha by the normalised score. Multiply the
+        // pre-baked alpha by `norm` (clamped to [0, 1]) so the hottest
+        // node lands at the full baked alpha and colder nodes fade
+        // linearly toward invisible.
+        let scaled_alpha = (color.a() as f32 * norm).clamp(0.0, 255.0) as u8;
+        // Rebuild the color with the scaled alpha, keeping the RGB
+        // pre-multiplied scale so additive blending still reads as warm.
+        let ring_color = egui::Color32::from_rgba_premultiplied(
+            ((color.r() as f32 * norm).clamp(0.0, 255.0)) as u8,
+            ((color.g() as f32 * norm).clamp(0.0, 255.0)) as u8,
+            ((color.b() as f32 * norm).clamp(0.0, 255.0)) as u8,
+            scaled_alpha,
+        );
+        painter.circle_filled(center, base_radius * mult, ring_color);
     }
 }
 
