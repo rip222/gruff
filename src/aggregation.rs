@@ -88,6 +88,41 @@ pub trait NodeAggregator {
     fn aggregate(&self, nodes: &[RawNode], ctx: &AggregationContext) -> AggregationResult;
 }
 
+/// Passthrough aggregator: every raw node maps to itself, no folder
+/// collapse. Used by the `collapse_barrels = false` flow so the call site
+/// in `aggregated_graph` doesn't need to special-case "skip aggregation"
+/// — `apply_aggregation` runs the same way regardless and just returns
+/// the file-level graph unchanged.
+#[derive(Debug, Default)]
+pub struct PassthroughAggregator;
+
+impl PassthroughAggregator {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl NodeAggregator for PassthroughAggregator {
+    fn aggregate(&self, nodes: &[RawNode], _ctx: &AggregationContext) -> AggregationResult {
+        let mut mapping: HashMap<NodeId, NodeId> = HashMap::new();
+        let mut out_nodes: Vec<Node> = Vec::with_capacity(nodes.len());
+        for raw in nodes {
+            mapping.insert(raw.id.clone(), raw.id.clone());
+            out_nodes.push(Node {
+                id: raw.id.clone(),
+                path: raw.path.clone(),
+                label: raw.label.clone(),
+                package: raw.package.clone(),
+                kind: raw.kind,
+            });
+        }
+        AggregationResult {
+            nodes: out_nodes,
+            mapping,
+        }
+    }
+}
+
 /// TypeScript/JavaScript barrel collapser. See module docs for the rule.
 #[derive(Debug, Default)]
 pub struct TsBarrelAggregator;

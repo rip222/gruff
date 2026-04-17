@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use crate::aggregation::{self, TsBarrelAggregator};
+use crate::aggregation::{self, PassthroughAggregator, TsBarrelAggregator};
 use crate::camera::Camera;
 use crate::colors;
 use crate::config::{self, Config};
@@ -767,13 +767,20 @@ fn is_readable_dir(path: &std::path::Path) -> bool {
     std::fs::read_dir(path).is_ok()
 }
 
-/// Run the barrel aggregator over the indexer's raw graph and return the
-/// display-level graph the UI actually renders. Called at every point where
-/// the app refreshes its live graph from the indexer — full load, rescan,
-/// test-toggle, and watcher pumps.
+/// Run the configured aggregator over the indexer's raw graph and return
+/// the display-level graph the UI actually renders. Called at every point
+/// where the app refreshes its live graph from the indexer — full load,
+/// rescan, test-toggle, barrel-toggle, and watcher pumps. The aggregator
+/// choice follows `indexer.options.collapse_barrels`: `true` runs the
+/// existing `TsBarrelAggregator`; `false` runs a passthrough so the
+/// graph stays at file-level granularity (madge's shape).
 fn aggregated_graph(indexer: &Indexer) -> Graph {
     let ctx = aggregation::context_from_workspace(&indexer.ws, &indexer.ctx);
-    aggregation::apply_aggregation(&indexer.graph, &ctx, &TsBarrelAggregator::new())
+    if indexer.options.collapse_barrels {
+        aggregation::apply_aggregation(&indexer.graph, &ctx, &TsBarrelAggregator::new())
+    } else {
+        aggregation::apply_aggregation(&indexer.graph, &ctx, &PassthroughAggregator::new())
+    }
 }
 
 /// Append `src` into `dst`, preserving ordering (removals first, additions

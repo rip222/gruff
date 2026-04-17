@@ -14,12 +14,28 @@ const SOURCE_EXTS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs"];
 
 /// Indexer knobs the UI can flip at runtime. Kept small — new filters belong
 /// here so the "what does the default graph show?" answer stays in one place.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct IndexerOptions {
     /// When false (default), test files (`*.test.*`, `*.spec.*`) are dropped
     /// from the graph. Toggle the menu item or call
     /// [`Indexer::set_include_tests`] to flip.
     pub include_tests: bool,
+    /// When true (default), folders that look like barrels (`index.ts`,
+    /// tsconfig `paths` targets, `package.json` `exports` targets) collapse
+    /// into a single display node and edges rewrite onto those endpoints.
+    /// When false, every file stays as its own node — the raw file-level
+    /// graph that matches madge's shape. Toggled via the View menu; see
+    /// [`GruffApp::set_collapse_barrels`] for the UI side.
+    pub collapse_barrels: bool,
+}
+
+impl Default for IndexerOptions {
+    fn default() -> Self {
+        Self {
+            include_tests: false,
+            collapse_barrels: true,
+        }
+    }
 }
 
 /// Node id prefix for synthetic external-package leaves. Picked so it can't
