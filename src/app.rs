@@ -268,14 +268,19 @@ impl GruffApp {
         self.last_root = Some(root.clone());
         self.indexer = Some(indexer);
 
-        // Remember this repo so the next launch re-opens it. Per the PRD this
-        // is the *only* thing persisted across sessions — layout, selection,
-        // and filter state are deliberately session-scoped. A write failure
-        // just means the user won't get auto-reopen; don't surface it.
-        if self.config.last_repo.as_ref() != Some(&root) {
-            self.config.last_repo = Some(root);
-            let _ = config::save(&self.config);
-        }
+        // Remember this repo so the next launch re-opens it, and push the
+        // folder onto the MRU list that backs `File → Open Recent`. Per the
+        // PRD these are the *only* things persisted across sessions —
+        // layout, selection, and filter state are deliberately session-
+        // scoped. `push` dedupes and caps, so reopening a folder already
+        // near the top is idempotent apart from bumping it back to first.
+        // We save unconditionally on every successful load so the MRU bump
+        // lands even when `last_repo` didn't change. A write failure just
+        // means the user won't get auto-reopen or an updated MRU; don't
+        // surface it.
+        self.config.last_repo = Some(root.clone());
+        self.config.recent.push(root);
+        let _ = config::save(&self.config);
 
         // Filter state is session-scoped: opening a new folder starts fresh
         // with every node visible. Must run *before* `rebuild_derived_indexes`
@@ -1062,6 +1067,15 @@ impl eframe::App for GruffApp {
 mod tests {
     use super::*;
 
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate the process-global `HOME` env var. Two
+    /// tests simultaneously pointing `$HOME` at different tempdirs races on
+    /// `config.toml` reads/writes; the mutex forces them to run one at a
+    /// time. `PoisonError` is unwrapped by `into_inner` so one failing test
+    /// doesn't cascade-fail every other HOME-mutating test.
+    static HOME_GUARD: Mutex<()> = Mutex::new(());
+
     #[test]
     fn user_interaction_breaks_auto_refit() {
         // The core PRD #16 guarantee for this issue: the first pan or zoom
@@ -1114,6 +1128,62 @@ mod tests {
     }
 
     #[test]
+    fn load_folder_persists_recents_across_app_rebuild() {
+        // End-to-end MRU persistence: open folder A, drop the app, rebuild
+        // it against the same `$HOME`, open folder B, then assert both
+        // folders show up in `config.recent` — B on top, A beneath it —
+        // across the rebuild boundary. This is the piece the unit tests on
+        // `RecentList` and the `config.rs` round-trip can't reach on their
+        // own: it verifies `load_folder` actually calls `push` + `save`.
+        //
+        // `set_var("HOME", …)` redirects `config::config_path` at a
+        // per-test tempdir so we don't stomp on the real user config.
+        // `unsafe` is required per the Rust 2024 edition contract; the
+        // `HOME_GUARD` mutex keeps concurrent HOME-mutating tests from
+        // racing on each other's `config.toml`.
+        let _guard = HOME_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+
+        let repo_a = tempfile::tempdir().unwrap();
+        std::fs::write(repo_a.path().join("a.ts"), "export const a = 1;").unwrap();
+        let repo_b = tempfile::tempdir().unwrap();
+        std::fs::write(repo_b.path().join("b.ts"), "export const b = 1;").unwrap();
+
+        // First app instance opens A. Drop it so only the persisted config
+        // remains — whatever the next app sees must come from disk.
+        let canonical_a = {
+            let app = GruffApp::with_path(repo_a.path().to_path_buf());
+            app.indexer.as_ref().unwrap().ws.root.clone()
+        };
+
+        // Second app instance: loads config from `$HOME`, opens B.
+        let canonical_b = {
+            let mut app = GruffApp::default();
+            assert_eq!(
+                app.config.recent.iter_excluding(None).count(),
+                1,
+                "rebuilt app must see the first load's entry from config.toml"
+            );
+            app.load_folder(repo_b.path().to_path_buf());
+            app.indexer.as_ref().unwrap().ws.root.clone()
+        };
+
+        // Third rebuild: config.toml on disk should now show B first, A
+        // second. Using the persisted config directly (not an app) keeps
+        // the assertion about what actually survived to disk.
+        let cfg = config::load();
+        let paths: Vec<&std::path::Path> = cfg.recent.iter_excluding(None).collect();
+        assert_eq!(
+            paths,
+            vec![canonical_b.as_path(), canonical_a.as_path()],
+            "MRU list must list B (most recent) before A after rebuild"
+        );
+    }
+
+    #[test]
     fn with_path_loads_graph_and_updates_last_repo() {
         // Valid-path CLI flow: `with_path` behaves like today's autoload
         // but starts from the passed directory directly. Assert the graph
@@ -1123,8 +1193,9 @@ mod tests {
         // The tempdir doubles as $HOME so `config::save` inside
         // `load_folder` writes to a throwaway ~/.gruff rather than the
         // real user config. `set_var` is process-global; guarded with
-        // `unsafe` per the Rust 2024 edition contract and kept to this
-        // single app-level test to avoid stepping on concurrent tests.
+        // `unsafe` per the Rust 2024 edition contract and serialized via
+        // `HOME_GUARD` so concurrent HOME-mutating tests don't race.
+        let _guard = HOME_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         unsafe {
             std::env::set_var("HOME", home.path());
