@@ -25,6 +25,79 @@ impl GruffApp {
             ui.separator();
         }
         self.draw_cycles_pane(ui);
+        if !self.graph.nodes.is_empty() {
+            ui.add_space(12.0);
+            ui.separator();
+            self.draw_dead_code_pane(ui);
+        }
+    }
+
+    /// Two-part dead-code report (#36). `Unreachable from entry` lists files
+    /// no entry-point-rooted walk touches; `No incoming imports` lists files
+    /// with zero in-degree. Both click-to-select and pan-to-node the same
+    /// way the Cycles pane frames a selected SCC, so the affordance carries
+    /// across the two panes. An empty sub-list renders a muted "none" line
+    /// rather than being hidden, which keeps the pane legible on a clean
+    /// repo ("no dead code" is a useful signal, not no-ui).
+    fn draw_dead_code_pane(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        ui.heading("Dead code");
+        ui.add_space(4.0);
+
+        let mut unreachable: Vec<NodeId> =
+            self.orphan_sets.unreachable_from_entries.iter().cloned().collect();
+        unreachable.sort();
+        let mut no_incoming: Vec<NodeId> =
+            self.orphan_sets.no_incoming_imports.iter().cloned().collect();
+        no_incoming.sort();
+
+        self.draw_dead_code_sub_list(ui, "Unreachable from entry", &unreachable, "orphan-unreachable");
+        ui.add_space(8.0);
+        self.draw_dead_code_sub_list(ui, "No incoming imports", &no_incoming, "orphan-no-incoming");
+    }
+
+    /// Render one orphan sub-list: a collapsible header showing the count
+    /// and a click-to-select row per id. `salt` disambiguates the
+    /// `ScrollArea` / `CollapsingHeader` state between the two sub-lists
+    /// so their open/closed flags don't collide. Empty lists still render
+    /// the "none" placeholder so the section structure is consistent
+    /// regardless of report shape.
+    fn draw_dead_code_sub_list(
+        &mut self,
+        ui: &mut egui::Ui,
+        title: &str,
+        ids: &[NodeId],
+        salt: &str,
+    ) {
+        let header = format!("{} ({})", title, ids.len());
+        egui::CollapsingHeader::new(header)
+            .id_salt(salt)
+            .default_open(false)
+            .show(ui, |ui| {
+                if ids.is_empty() {
+                    ui.label(egui::RichText::new("none").italics().color(colors::HINT));
+                    return;
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt(format!("{salt}-scroll"))
+                    .max_height(220.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for id in ids {
+                            // Full-width button so the whole row is the
+                            // click target — matches the cycle-pane
+                            // affordance and keeps the pane kb-a11y-clean
+                            // without a separate "select" action.
+                            let resp = ui.add(
+                                egui::Button::new(egui::RichText::new(id).monospace().small())
+                                    .min_size(egui::vec2(ui.available_width(), 0.0)),
+                            );
+                            if resp.clicked() {
+                                self.select_and_frame_node(id);
+                            }
+                        }
+                    });
+            });
     }
 
     fn draw_selection_pane(&mut self, ui: &mut egui::Ui) {

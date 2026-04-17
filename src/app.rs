@@ -122,6 +122,12 @@ pub struct GruffApp {
     /// Deferred "frame this cycle in the viewport" request set by the sidebar
     /// and consumed by `draw_canvas` (which has the screen rect in hand).
     frame_request: Option<usize>,
+    /// Deferred "pan and snap-zoom to a single node" request, set when the
+    /// dead-code pane's click-to-select affordance fires. Consumed by
+    /// `draw_canvas` on the next frame, same way as `frame_request`. Kept
+    /// separate from `frame_request` because the cycle-framing helper
+    /// takes an index into `self.cycles`, not an id.
+    node_frame_request: Option<NodeId>,
     /// Deferred "fit the full graph into the viewport" request — produced by
     /// folder-load (snap) and the `F` shortcut (tween), consumed by
     /// `draw_canvas` once the canvas rect is known.
@@ -231,6 +237,7 @@ impl Default for GruffApp {
             cycles: Vec::new(),
             cycle_of: HashMap::new(),
             frame_request: None,
+            node_frame_request: None,
             fit_request: None,
             highlight: None,
             selected: None,
@@ -346,6 +353,7 @@ impl GruffApp {
         // `orphan_detector::detect` sees the final aggregated node set.
         self.recompute_orphan_sets();
         self.frame_request = None;
+        self.node_frame_request = None;
         self.highlight = None;
         // Reset the search overlay on a new folder load — the cached match
         // set references node ids from the previous graph and would be
@@ -418,6 +426,7 @@ impl GruffApp {
         self.rebuild_derived_indexes();
         self.resync_layout();
         self.frame_request = None;
+        self.node_frame_request = None;
         self.highlight = None;
         // A node that was just filtered out of the graph can't stay
         // selected — clear rather than render a dangling sidebar.
@@ -461,6 +470,7 @@ impl GruffApp {
         self.rebuild_derived_indexes();
         self.resync_layout();
         self.frame_request = None;
+        self.node_frame_request = None;
         self.highlight = None;
         // Selection might point at a barrel display node that just
         // disappeared (or a file node that just got swallowed by a
@@ -507,6 +517,7 @@ impl GruffApp {
         self.recompute_orphan_sets();
         self.resync_layout();
         self.frame_request = None;
+        self.node_frame_request = None;
         self.highlight = None;
         self.selected = None;
         self.blast_cone = None;
@@ -857,6 +868,25 @@ impl GruffApp {
     /// explicitly ties the recompute to "every full rescan and every
     /// watcher diff." An app with no loaded workspace produces an empty
     /// report (no entries, no nodes) without panicking.
+    /// Select `id` and request the canvas to pan/frame to it. Used by the
+    /// dead-code sidebar pane's click-to-select rows; the orphan panes
+    /// share the cycles-pane affordance of "click a row → center + select."
+    /// Silent no-op on an unknown id — a stale id in the sidebar just
+    /// leaves things where they are rather than panning into empty space.
+    pub(super) fn select_and_frame_node(&mut self, id: &NodeId) {
+        if !self.graph.nodes.contains_key(id) {
+            return;
+        }
+        self.selected = Some(id.clone());
+        self.node_frame_request = Some(id.clone());
+        // Re-arm the blast-radius dim on a fresh selection, same as a
+        // canvas click. Keeps the sidebar route behaviourally identical
+        // to clicking the node on the canvas.
+        self.blast_radius_active = true;
+        self.highlight = Some(self.build_node_highlight(id));
+        self.recompute_blast_cone();
+    }
+
     pub(super) fn recompute_orphan_sets(&mut self) {
         let entries = match self.indexer.as_ref() {
             Some(indexer) => entry_points::discover(&indexer.ws, &self.config),

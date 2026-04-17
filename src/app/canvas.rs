@@ -91,6 +91,28 @@ impl GruffApp {
         self.camera.snap_to_target();
     }
 
+    /// Pan the camera so `id`'s current layout position sits at the
+    /// viewport center. Used by the dead-code sidebar pane's
+    /// click-to-select affordance: the selection was already armed by
+    /// [`GruffApp::select_and_frame_node`]; this follows through with the
+    /// visual centering. Snap (not tween) matches the cycle-framing
+    /// behaviour. No-op on an unknown id or a node with no layout position
+    /// (hidden, or not yet synced into the layout).
+    fn frame_node(&mut self, id: &NodeId, rect: egui::Rect) {
+        let Some(pos) = self.layout.get(id) else {
+            return;
+        };
+        // Degenerate point-bbox — `Camera::fit`'s additive padding gives
+        // the single node comfortable breathing room around the center.
+        let bbox = Bbox {
+            min: pos,
+            max: pos,
+        };
+        self.camera
+            .fit(bbox, Vec2::new(rect.width(), rect.height()), FIT_PADDING);
+        self.camera.snap_to_target();
+    }
+
     /// Fit the camera to every visible node's bounding box. Used by the
     /// initial folder-load fit (snap), the `F` shortcut (tween), and the
     /// filter-change flow (tween). A layout with no positions is a no-op —
@@ -210,6 +232,9 @@ impl GruffApp {
         // in practice they're never both set at once.
         if let Some(idx) = self.frame_request.take() {
             self.frame_cycle(idx, rect);
+        }
+        if let Some(id) = self.node_frame_request.take() {
+            self.frame_node(&id, rect);
         }
         if let Some(mode) = self.fit_request.take() {
             self.fit_all(rect, mode);
