@@ -3,7 +3,11 @@ use egui::Color32;
 pub const BG: Color32 = Color32::from_rgb(0x0E, 0x10, 0x14);
 /// Default node color when no owning package is known (stray files).
 pub const NODE: Color32 = Color32::from_rgb(0x6D, 0xA7, 0xE8);
-pub const EDGE: Color32 = Color32::from_rgb(0x33, 0x3B, 0x47);
+// Lifted from 0x333B47 when arrowheads landed (#28). A 6-8 px arrowhead
+// triangle at the former level read as nearly-black against the dark bg —
+// this shade keeps the line subdued but gives the triangle enough contrast
+// to register as a direction cue.
+pub const EDGE: Color32 = Color32::from_rgb(0x55, 0x5F, 0x70);
 /// Edges that participate in a circular dependency. Bright red so cycles
 /// read at a glance on the dark background without being washed out.
 pub const CYCLE_EDGE: Color32 = Color32::from_rgb(0xE2, 0x4B, 0x4B);

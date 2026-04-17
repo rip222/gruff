@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use eframe::egui;
 
@@ -56,6 +56,16 @@ const LABEL_MIN_SCREEN_FONT_PX: f32 = 7.0;
 /// it. Prevents truly degenerate zero-width rects from producing an invisible
 /// click target.
 const RECT_MIN_WIDTH: f32 = 14.0;
+
+/// Arrowhead length in screen pixels, measured along the edge direction.
+/// Sized so the triangle reads as a direction cue at default zoom without
+/// dominating a short edge between two neighboring nodes.
+const ARROWHEAD_LEN_PX: f32 = 8.0;
+
+/// Arrowhead half-width in screen pixels, measured perpendicular to the edge.
+/// Narrower than `ARROWHEAD_LEN_PX` gives a slender triangle that reads as
+/// "arrow" rather than "blob".
+const ARROWHEAD_HALF_WIDTH_PX: f32 = 3.5;
 
 impl GruffApp {
     /// True when this edge lies inside a cyclic SCC. An edge `(u,v)` is on a
@@ -367,6 +377,20 @@ impl GruffApp {
             .filter(|s| !s.input.trim().is_empty())
             .map(|s| &s.matches);
 
+        // Precompute each visible node's screen-space half-extents so the
+        // edge loop can trim lines and anchor arrowheads at the same AABB
+        // the node body and overlap resolver use. The label loop below
+        // reuses the same map instead of re-measuring.
+        let zoom = self.camera.zoom();
+        let node_half_extents: HashMap<NodeId, (f32, f32)> = self
+            .layout
+            .iter()
+            .map(|(id, _)| {
+                let s = self.node_render_size_world(id, ui);
+                (id.clone(), (s.x * zoom * 0.5, s.y * zoom * 0.5))
+            })
+            .collect();
+
         // Edges first so nodes overlap them. Edges with any hidden endpoint
         // drop out of rendering entirely — PRD #16's "no dashed short-
         // circuit edges" rule. `layout.get` already returns `None` for
@@ -417,25 +441,45 @@ impl GruffApp {
             } else {
                 (1.0, base)
             };
-            painter.line_segment([a, b], egui::Stroke::new(width, color));
+
+            // Trim the segment against each endpoint's rect AABB so the line
+            // stops at the target's boundary (leaves room for the arrowhead
+            // flush on the edge) and doesn't bleed out from behind the
+            // source's fill. If either trim fails — tiny rect, coincident
+            // centers, etc. — fall back to the raw segment rather than
+            // dropping the edge entirely.
+            let src_half = node_half_extents.get(&edge.from);
+            let tgt_half = node_half_extents.get(&edge.to);
+            let (line_start, line_end, tip) = match (src_half, tgt_half) {
+                (Some(&(sw, sh)), Some(&(tw, th))) => {
+                    let start = clip_ray_from_center(a, b, sw, sh).unwrap_or(a);
+                    let tip = clip_ray_from_center(b, a, tw, th).unwrap_or(b);
+                    (start, tip, Some(tip))
+                }
+                _ => (a, b, None),
+            };
+            painter.line_segment([line_start, line_end], egui::Stroke::new(width, color));
+            if let Some(tip) = tip {
+                draw_arrowhead(&painter, line_start, tip, color);
+            }
         }
 
         // Labels render in world space — font size scales with zoom — and
         // hide entirely when they'd be sub-readable. The rect itself always
         // draws, so the graph shape stays legible at low zoom.
-        let zoom = self.camera.zoom();
         let screen_font_px = LABEL_WORLD_FONT_SIZE * zoom;
         let labels_visible = screen_font_px >= LABEL_MIN_SCREEN_FONT_PX;
         let label_font = egui::FontId::proportional(screen_font_px);
 
         for (id, pos) in self.layout.iter() {
             let p = self.world_to_screen(pos, center);
-            let size_world = self.node_render_size_world(id, ui);
-            // World-space rect centered on the node position; project the
-            // corners to screen by scaling with zoom. This is equivalent to
-            // `world_to_screen` of the corners but avoids two extra calls.
-            let half_w_px = size_world.x * zoom * 0.5;
-            let half_h_px = size_world.y * zoom * 0.5;
+            let (half_w_px, half_h_px) = node_half_extents
+                .get(id)
+                .copied()
+                .unwrap_or_else(|| {
+                    let s = self.node_render_size_world(id, ui);
+                    (s.x * zoom * 0.5, s.y * zoom * 0.5)
+                });
             let rect = egui::Rect::from_min_max(
                 egui::pos2(p.x - half_w_px, p.y - half_h_px),
                 egui::pos2(p.x + half_w_px, p.y + half_h_px),
@@ -533,6 +577,80 @@ fn measure_text_width(ui: &egui::Ui, text: &str, font_size: f32) -> f32 {
         .painter()
         .layout_no_wrap(text.to_string(), font_id, egui::Color32::WHITE);
     galley.size().x
+}
+
+/// Intersect the ray from `center` toward `toward` with an axis-aligned
+/// rectangle centered at `center` with half-extents `(half_w, half_h)`, and
+/// return the boundary hit point. Uses the slab method: each axis yields a
+/// parametric `t` at which the ray crosses the rect's near/far slab; the
+/// smallest positive `t` whose perpendicular coordinate stays within the
+/// opposite slab is the boundary hit. Returns `None` for degenerate input
+/// (zero-length ray or zero-size rect) so the caller can fall back to the
+/// raw endpoint instead of drawing a nonsense segment.
+fn clip_ray_from_center(
+    center: egui::Pos2,
+    toward: egui::Pos2,
+    half_w: f32,
+    half_h: f32,
+) -> Option<egui::Pos2> {
+    let dx = toward.x - center.x;
+    let dy = toward.y - center.y;
+    if half_w <= 0.0 || half_h <= 0.0 {
+        return None;
+    }
+    if dx.abs() < f32::EPSILON && dy.abs() < f32::EPSILON {
+        return None;
+    }
+    // Parametric t along the ray where it crosses each slab boundary. We
+    // want the smaller of |t_x|, |t_y| — whichever axis the ray exits
+    // first is the axis whose slab boundary is the true hit.
+    let tx = if dx.abs() > f32::EPSILON {
+        half_w / dx.abs()
+    } else {
+        f32::INFINITY
+    };
+    let ty = if dy.abs() > f32::EPSILON {
+        half_h / dy.abs()
+    } else {
+        f32::INFINITY
+    };
+    let t = tx.min(ty);
+    Some(egui::pos2(center.x + dx * t, center.y + dy * t))
+}
+
+/// Draw a filled arrowhead triangle with its tip anchored at `tip` and its
+/// base two points `ARROWHEAD_LEN_PX` back along the line from `tip` toward
+/// `from`. `ARROWHEAD_HALF_WIDTH_PX` sets the spread. If the edge is shorter
+/// than the arrowhead length the triangle is suppressed — drawing a
+/// full-size arrow on a 3 px edge would eat the entire line.
+fn draw_arrowhead(
+    painter: &egui::Painter,
+    from: egui::Pos2,
+    tip: egui::Pos2,
+    color: egui::Color32,
+) {
+    let dx = tip.x - from.x;
+    let dy = tip.y - from.y;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < ARROWHEAD_LEN_PX {
+        return;
+    }
+    let ux = dx / len;
+    let uy = dy / len;
+    // Base center: step back from the tip along the edge direction by the
+    // arrowhead length. Perpendicular axis (-uy, ux) spreads the base.
+    let bx = tip.x - ux * ARROWHEAD_LEN_PX;
+    let by = tip.y - uy * ARROWHEAD_LEN_PX;
+    let px = -uy * ARROWHEAD_HALF_WIDTH_PX;
+    let py = ux * ARROWHEAD_HALF_WIDTH_PX;
+    let p0 = tip;
+    let p1 = egui::pos2(bx + px, by + py);
+    let p2 = egui::pos2(bx - px, by - py);
+    painter.add(egui::Shape::convex_polygon(
+        vec![p0, p1, p2],
+        color,
+        egui::Stroke::NONE,
+    ));
 }
 
 /// Shortest distance from a point to a line segment in 2D (screen space).
