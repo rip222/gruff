@@ -19,5 +19,6 @@ pub mod parser;
 pub mod recents;
 pub mod resolver;
 pub mod search;
+pub mod shortcuts;
 pub mod watcher;
 pub mod workspace;
