@@ -89,6 +89,10 @@ pub struct GruffApp {
     /// somewhere to bind without reaching into `self.indexer` through a
     /// closure. Kept in sync by [`GruffApp::set_include_tests`].
     include_tests: bool,
+    /// Mirrors the indexer's `collapse_barrels` option for the same reason.
+    /// Default `true` preserves the long-standing barrel-collapse behaviour;
+    /// flipping the menu checkbox calls [`GruffApp::set_collapse_barrels`].
+    collapse_barrels: bool,
     layout: Layout,
     imports: HashMap<NodeId, Vec<NodeId>>,
     imported_by: HashMap<NodeId, Vec<NodeId>>,
@@ -179,6 +183,7 @@ impl Default for GruffApp {
         Self {
             graph: Graph::new(),
             include_tests: false,
+            collapse_barrels: true,
             layout: Layout::new(),
             imports: HashMap::new(),
             imported_by: HashMap::new(),
@@ -226,11 +231,15 @@ impl GruffApp {
     fn load_folder(&mut self, path: PathBuf) {
         let start = Instant::now();
         let mut indexer = Indexer::build(&path);
-        // Carry the toggle across folder changes so the user doesn't have to
-        // re-enable "include test files" every time they open a new repo.
+        // Carry the toggles across folder changes so the user doesn't have
+        // to re-set them every time they open a new repo.
         if indexer.options.include_tests != self.include_tests {
             indexer.set_include_tests(self.include_tests);
         }
+        // Barrel collapse doesn't need an indexer rescan — it only changes
+        // the aggregator. Set the flag in place; `aggregated_graph` reads
+        // it on the next call.
+        indexer.options.collapse_barrels = self.collapse_barrels;
         self.graph = aggregated_graph(&indexer);
         self.unresolved_dynamic = indexer.unresolved_dynamic;
         let root = indexer.ws.root.clone();
@@ -325,6 +334,40 @@ impl GruffApp {
         self.highlight = None;
         // A node that was just filtered out of the graph can't stay
         // selected — clear rather than render a dangling sidebar.
+        if let Some(selected) = self.selected.clone() {
+            if !self.graph.nodes.contains_key(&selected) {
+                self.selected = None;
+            }
+        }
+        self.set_status_after_index(start.elapsed());
+    }
+
+    /// Flip the "collapse barrels into one node" toggle. No indexer rescan
+    /// — barrels are an aggregation-time concern — so this just re-runs
+    /// `aggregated_graph` and rebuilds derived indexes / layout. Mirrors
+    /// the structure of [`Self::set_include_tests`] including the no-op
+    /// guard so menu redraws don't trigger spurious rebuilds.
+    fn set_collapse_barrels(&mut self, collapse: bool) {
+        if self.collapse_barrels == collapse {
+            return;
+        }
+        self.collapse_barrels = collapse;
+        let Some(indexer) = self.indexer.as_mut() else {
+            // No folder loaded yet — preference still persists for the
+            // next `load_folder` to pick up.
+            return;
+        };
+        let start = Instant::now();
+        indexer.options.collapse_barrels = collapse;
+        self.graph = aggregated_graph(indexer);
+        self.unresolved_dynamic = indexer.unresolved_dynamic;
+        self.rebuild_derived_indexes();
+        self.resync_layout();
+        self.frame_request = None;
+        self.highlight = None;
+        // Selection might point at a barrel display node that just
+        // disappeared (or a file node that just got swallowed by a
+        // barrel) — drop it so the sidebar doesn't dangle.
         if let Some(selected) = self.selected.clone() {
             if !self.graph.nodes.contains_key(&selected) {
                 self.selected = None;
@@ -919,6 +962,13 @@ impl eframe::App for GruffApp {
                         .changed()
                     {
                         self.set_include_tests(include_tests);
+                    }
+                    let mut collapse_barrels = self.collapse_barrels;
+                    if ui
+                        .checkbox(&mut collapse_barrels, "Collapse barrels into one node")
+                        .changed()
+                    {
+                        self.set_collapse_barrels(collapse_barrels);
                     }
                 });
             });
