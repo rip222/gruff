@@ -11,6 +11,7 @@ pub mod filters;
 pub mod graph;
 pub mod indexer;
 pub mod layout;
+pub mod lib_detect;
 pub mod node_label;
 pub mod package_tree;
 pub mod parser;

@@ -14,6 +14,7 @@ use crate::filter_state::FilterState;
 use crate::graph::{Graph, GraphDiff, NodeId};
 use crate::indexer::Indexer;
 use crate::layout::Layout;
+use crate::lib_detect::{self, LibDetector, TsLibDetector};
 use crate::watcher::{ChangeEvent, Watcher};
 
 mod canvas;
@@ -68,6 +69,12 @@ pub struct GruffApp {
     /// index order is whatever the first sweep through `graph.nodes` produced —
     /// good enough for deterministic colors within a single session.
     package_indices: HashMap<String, usize>,
+    /// Per-node lib-shade key: `(lib_index_within_package, lib_count_in_package)`.
+    /// Populated by `rebuild_derived_indexes` from the current workspace's
+    /// lib roots. Nodes without a lib assignment (no enclosing `tsconfig.json`
+    /// or a single-lib package) are absent — `node_color` falls back to
+    /// `package_color`, which matches the pre-#26 palette bit-identically.
+    node_lib_shade: HashMap<NodeId, (usize, usize)>,
     /// Cyclic SCCs reported by `Graph::cycles`. Each entry is the node set of
     /// one circular-dependency region. Recomputed on every load.
     cycles: Vec<Vec<NodeId>>,
@@ -143,6 +150,7 @@ impl Default for GruffApp {
             imports: HashMap::new(),
             imported_by: HashMap::new(),
             package_indices: HashMap::new(),
+            node_lib_shade: HashMap::new(),
             cycles: Vec::new(),
             cycle_of: HashMap::new(),
             frame_request: None,
@@ -354,7 +362,52 @@ impl GruffApp {
             self.package_indices.insert(name.to_string(), next);
         }
 
+        self.rebuild_lib_shades();
         self.recompute_cycles();
+    }
+
+    /// Populate `self.node_lib_shade` by running the lib detector against the
+    /// current workspace and assigning every file-kind node to its deepest
+    /// enclosing lib. Packages with only one lib skip assignment entirely so
+    /// `node_color` collapses to `package_color` for them (bit-identical to
+    /// pre-#26 rendering, per the acceptance criteria).
+    fn rebuild_lib_shades(&mut self) {
+        self.node_lib_shade.clear();
+        let Some(indexer) = self.indexer.as_ref() else {
+            return;
+        };
+        let libs = TsLibDetector::new().detect(&indexer.ws);
+        if libs.is_empty() {
+            return;
+        }
+        let grouped = lib_detect::libs_by_package(&libs);
+
+        // Global lib-idx -> (within-package idx, package's lib count).
+        let mut shade_by_lib: HashMap<usize, (usize, usize)> = HashMap::new();
+        for (_pkg, indices) in &grouped {
+            let count = indices.len();
+            if count <= 1 {
+                // Single-lib packages collapse to `package_color`; leaving
+                // them out of `node_lib_shade` makes that fallback automatic.
+                continue;
+            }
+            for (within, &global) in indices.iter().enumerate() {
+                shade_by_lib.insert(global, (within, count));
+            }
+        }
+
+        for (id, node) in &self.graph.nodes {
+            // Barrel display nodes carry the folder path; file nodes carry
+            // the file path. `deepest_lib_for` handles both — `starts_with`
+            // is equally valid for a file inside a lib folder and for the
+            // folder itself being (or living under) the lib.
+            let Some(global) = lib_detect::deepest_lib_for(&node.path, &libs) else {
+                continue;
+            };
+            if let Some(&shade) = shade_by_lib.get(&global) {
+                self.node_lib_shade.insert(id.clone(), shade);
+            }
+        }
     }
 
     /// Recompute the visible-subgraph cycle set and its reverse index.

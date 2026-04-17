@@ -112,7 +112,10 @@ impl GruffApp {
 
     /// Color for an unselected node. External leaves render neutral gray so
     /// `node_modules` packages read as "not our code" at a glance; workspace
-    /// files take their owning package's color; fallbacks use [`colors::NODE`].
+    /// files take a shade of their owning package's color that identifies
+    /// which lib (folder with its own `tsconfig.json`) the node belongs to.
+    /// Packages with zero or one libs fall through to `package_color`, which
+    /// is bit-identical to the pre-#26 rendering.
     pub(super) fn node_color(&self, id: &NodeId) -> egui::Color32 {
         let Some(node) = self.graph.nodes.get(id) else {
             return colors::NODE;
@@ -123,10 +126,13 @@ impl GruffApp {
         let Some(pkg) = node.package.as_deref() else {
             return colors::NODE;
         };
-        let Some(&idx) = self.package_indices.get(pkg) else {
+        let Some(&pkg_idx) = self.package_indices.get(pkg) else {
             return colors::NODE;
         };
-        colors::package_color(idx)
+        if let Some(&(lib_idx, lib_count)) = self.node_lib_shade.get(id) {
+            return colors::lib_color(pkg_idx, lib_idx, lib_count);
+        }
+        colors::package_color(pkg_idx)
     }
 
     /// World-space size of a node's rounded-rect body. Width is driven by the

@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use ignore::WalkBuilder;
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,11 +91,28 @@ impl Workspace {
             });
         }
 
-        let mut tsconfigs = Vec::new();
-        for pkg in &packages {
-            let ts = pkg.root.join("tsconfig.json");
-            if ts.is_file() {
-                tsconfigs.push(ts.canonicalize().unwrap_or(ts));
+        // Every `tsconfig.json` under the workspace root (respecting gitignore
+        // and skipping `node_modules`), not just the one at each package root.
+        // Nested tsconfigs are the lib-detector's signal (#26), and the
+        // resolver already handles multiple tsconfigs without issue.
+        let mut tsconfigs: Vec<PathBuf> = Vec::new();
+        let mut seen_ts: HashSet<PathBuf> = HashSet::new();
+        let walker = WalkBuilder::new(&root)
+            .follow_links(false)
+            .require_git(false)
+            .filter_entry(|e| e.file_name() != "node_modules")
+            .build();
+        for entry in walker.filter_map(Result::ok) {
+            if entry.file_name() != "tsconfig.json" {
+                continue;
+            }
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            if seen_ts.insert(canon.clone()) {
+                tsconfigs.push(canon);
             }
         }
 
