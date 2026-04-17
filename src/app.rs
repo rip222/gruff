@@ -1259,4 +1259,86 @@ mod tests {
         assert!(app.fit_request.is_none());
         assert_eq!(app.cycles.len(), 1);
     }
+
+    // --- collapse_barrels toggle (#29) ------------------------------------
+
+    /// Build the canonical barrel-toggle workspace: a single package with
+    /// `src/index.ts` + `src/util.ts` (so `src/` looks like a barrel) and
+    /// a sibling `bar.ts` that imports from `./src/util`.
+    fn write_barrel_toggle_fixture(root: &std::path::Path) {
+        std::fs::write(root.join("package.json"), r#"{"name":"app"}"#).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/index.ts"), "export * from \"./util\";\n").unwrap();
+        std::fs::write(root.join("src/util.ts"), "export const x = 1;\n").unwrap();
+        std::fs::write(root.join("bar.ts"), "import { x } from \"./src/util\";\n").unwrap();
+    }
+
+    #[test]
+    fn collapse_barrels_default_collapses_src_into_one_node() {
+        // Default flow: `src/` collapses into a barrel display node and
+        // bar.ts → src/util becomes bar.ts → barrel:src.
+        let dir = tempfile::tempdir().unwrap();
+        write_barrel_toggle_fixture(dir.path());
+
+        let indexer = crate::indexer::Indexer::build(dir.path());
+        assert!(indexer.options.collapse_barrels, "default must be true");
+        let g = aggregated_graph(&indexer);
+
+        // Exactly one barrel node, no separate src/index or src/util nodes.
+        let barrel_count = g.nodes.values().filter(|n| n.id.starts_with("barrel:")).count();
+        assert_eq!(barrel_count, 1, "expected exactly one barrel display node");
+        assert!(
+            g.nodes.values().all(|n| n.label != "util.ts" && n.label != "index.ts"),
+            "src/util.ts and src/index.ts must not appear as separate nodes when collapsed"
+        );
+
+        // The bar.ts → src/util edge must rewrite onto bar.ts → barrel:src.
+        let bar_to_barrel = g
+            .edges
+            .iter()
+            .filter(|e| e.from.ends_with("bar.ts") && e.to.starts_with("barrel:"))
+            .count();
+        assert_eq!(
+            bar_to_barrel, 1,
+            "expected one rewritten edge from bar.ts to the barrel"
+        );
+    }
+
+    #[test]
+    fn collapse_barrels_off_keeps_src_files_separate() {
+        // Same fixture, flag flipped: src/ stays expanded, bar.ts →
+        // src/util.ts is the literal file-level edge madge would produce.
+        let dir = tempfile::tempdir().unwrap();
+        write_barrel_toggle_fixture(dir.path());
+
+        let mut indexer = crate::indexer::Indexer::build(dir.path());
+        indexer.options.collapse_barrels = false;
+        let g = aggregated_graph(&indexer);
+
+        // No barrel nodes — every src/* file shows up as itself.
+        assert!(
+            g.nodes.values().all(|n| !n.id.starts_with("barrel:")),
+            "no barrel nodes when collapse_barrels = false"
+        );
+        let labels: std::collections::BTreeSet<_> =
+            g.nodes.values().map(|n| n.label.clone()).collect();
+        for expected in ["bar.ts", "index.ts", "util.ts"] {
+            assert!(
+                labels.contains(expected),
+                "expected file node {expected} in expanded graph, got {labels:?}"
+            );
+        }
+
+        // The original file-level edge bar.ts → src/util.ts must survive
+        // unrewritten.
+        let bar_to_util = g
+            .edges
+            .iter()
+            .filter(|e| e.from.ends_with("bar.ts") && e.to.ends_with("src/util.ts"))
+            .count();
+        assert_eq!(
+            bar_to_util, 1,
+            "expected the literal bar.ts -> src/util.ts edge when expanded"
+        );
+    }
 }
