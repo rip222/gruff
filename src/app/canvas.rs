@@ -281,7 +281,7 @@ impl GruffApp {
         if response.clicked() {
             if let Some(click_pos) = response.interact_pointer_pos() {
                 if let Some(node) = self.pick_node(click_pos, center, ui) {
-                    self.highlight = Some(self.build_one_hop_highlight(&node));
+                    self.highlight = Some(self.build_node_highlight(&node));
                     self.selected = Some(node);
                 } else {
                     self.selected = None;
