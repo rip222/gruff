@@ -15,6 +15,7 @@ pub mod indexer;
 pub mod layout;
 pub mod lib_detect;
 pub mod node_label;
+pub mod orphan_detector;
 pub mod package_tree;
 pub mod parser;
 pub mod reachability;
