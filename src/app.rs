@@ -713,6 +713,70 @@ impl GruffApp {
         errors
     }
 
+    /// Render the `File → Open Recent ▸ / Clear Recent` entries. Stale
+    /// entries (paths that no longer resolve to a live filesystem node)
+    /// are pruned *during* this render pass and the pruned config is saved
+    /// — pruning at render time bounds the check to `MAX_RECENTS` calls and
+    /// keeps the submenu honest without waking up on every folder change.
+    ///
+    /// When the list is empty (or every entry is the currently-loaded
+    /// folder) the `Open Recent` item renders disabled, and `Clear Recent`
+    /// follows the same rule — a greyed-out entry signals "there's a
+    /// concept here, it's just empty right now" rather than hiding the
+    /// affordance entirely.
+    fn render_recent_submenu(&mut self, ui: &mut egui::Ui) {
+        // Prune before rendering so the greyed-out state below reflects
+        // reality — otherwise a submenu of only-stale paths would look
+        // active but open to nothing. Save on any change so the pruned
+        // list survives the next launch.
+        let before = self.config.recent.len();
+        self.config.recent.prune_stale(|p| std::fs::metadata(p).is_ok());
+        if self.config.recent.len() != before {
+            let _ = config::save(&self.config);
+        }
+
+        // Pre-collect entries so the submenu closure doesn't borrow
+        // `self.config` while we also need `&mut self` to load a picked
+        // folder inside the closure.
+        let current = self.last_root.clone();
+        let entries: Vec<PathBuf> = self
+            .config
+            .recent
+            .iter_excluding(current.as_deref())
+            .map(PathBuf::from)
+            .collect();
+        let has_entries = !entries.is_empty();
+        let has_any = !self.config.recent.is_empty();
+
+        // When there's nothing to show, render a disabled placeholder
+        // instead of an empty open-able submenu. `add_enabled(false, …)`
+        // gives the greyed-out affordance the PRD asks for without
+        // duplicating the submenu-button chrome.
+        if !has_entries {
+            ui.add_enabled(false, egui::Button::new("Open Recent"));
+        } else {
+            ui.menu_button("Open Recent", |ui| {
+                for path in &entries {
+                    let label = recent_menu_label(path);
+                    if ui.button(label).clicked() {
+                        ui.close();
+                        self.load_folder(path.clone());
+                        break;
+                    }
+                }
+            });
+        }
+
+        if ui
+            .add_enabled(has_any, egui::Button::new("Clear Recent"))
+            .clicked()
+        {
+            ui.close();
+            self.config.recent.clear();
+            let _ = config::save(&self.config);
+        }
+    }
+
     /// Write the current graph out as JSON at a user-picked path. Backs the
     /// "Export graph as JSON…" menu item. Errors from the save dialog (user
     /// cancelled) are silent; write failures surface in the status bar.
@@ -835,6 +899,21 @@ impl GruffApp {
 /// `read_dir` implies existence, readability, and that it isn't a plain file.
 fn is_readable_dir(path: &std::path::Path) -> bool {
     std::fs::read_dir(path).is_ok()
+}
+
+/// Build the menu label for a recent folder: the folder's own name with
+/// the parent directory in parentheses when available, so two sibling
+/// repos named `app` can be distinguished at a glance. Falls back to the
+/// full display string if the path has no recognizable file name (root
+/// directories, exotic paths).
+fn recent_menu_label(path: &std::path::Path) -> String {
+    let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return path.display().to_string();
+    };
+    match path.parent().and_then(|p| p.file_name()) {
+        Some(parent) => format!("{name}  ({})", parent.to_string_lossy()),
+        None => name,
+    }
 }
 
 /// Run the configured aggregator over the indexer's raw graph and return
@@ -962,6 +1041,7 @@ impl eframe::App for GruffApp {
                             self.load_folder(dir);
                         }
                     }
+                    self.render_recent_submenu(ui);
                     ui.separator();
                     // Only enable export when there's an indexed graph — an
                     // empty export would be misleading rather than useful.
