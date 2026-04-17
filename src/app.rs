@@ -56,6 +56,33 @@ const SETTLE_TIME_BUDGET: Duration = Duration::from_millis(300);
 /// look "still moving" to the camera.
 const SETTLED_VELOCITY: f32 = 1.0;
 
+/// Approximate world-space width of a single glyph at the canvas's label font
+/// size (see `LABEL_WORLD_FONT_SIZE` in `app/canvas.rs`). Used only for the
+/// pre-render heuristic that sizes `Layout::k` — the renderer measures each
+/// label exactly, but the spring constant has to be calibrated before we have
+/// an `egui::Ui` in hand during `load_folder`. Proportional fonts average
+/// ≈ 0.55 × font-size per glyph; we round up so the resulting `k` errs toward
+/// too-much whitespace rather than too-little.
+const APPROX_CHAR_WIDTH_WORLD: f32 = 7.2;
+
+/// Additive padding on the estimated widest rect, matching the renderer's
+/// `RECT_H_PADDING` × 2. Keeps the heuristic consistent with how wide rects
+/// actually draw so the calibrated `k` tracks real rendered width.
+const APPROX_RECT_H_PADDING_TOTAL: f32 = 12.0;
+
+/// Additive slack on top of the largest rendered node extent when deriving
+/// `Layout::k`. Edge-attraction equilibrium sits at `d ≈ k`, so without a
+/// margin two max-width rects connected by an edge would settle exactly
+/// touching. A small margin opens visible whitespace between them without
+/// blowing the overall layout up.
+const K_SPACING_MARGIN: f32 = 24.0;
+
+/// Floor for the calibrated spring constant. On graphs whose widest label is
+/// tiny (single-char filenames, empty labels), the derived `k` could collapse
+/// below the pre-calibration default and make the layout feel cramped — the
+/// floor pins it to the old `Layout::new` value so those graphs look identical.
+const K_SPACING_FLOOR: f32 = 55.0;
+
 pub struct GruffApp {
     graph: Graph,
     /// Mirrors the indexer's `include_tests` option so the menu checkbox has
@@ -234,6 +261,11 @@ impl GruffApp {
 
         self.layout = Layout::new();
         self.layout.sync(&self.visible_graph());
+        // Scale the spring constant to the widest label before settling so
+        // the settle pass equilibrates at a spacing that already accounts
+        // for rendered rect widths — otherwise the first view frames the
+        // graph with rects stacked on one another.
+        self.calibrate_layout_spring_constant();
         self.overlap_resolved = false;
         self.selected = None;
         self.camera = Camera::new();
@@ -477,10 +509,38 @@ impl GruffApp {
         } else {
             self.layout.sync(&self.visible_graph());
         }
+        self.calibrate_layout_spring_constant();
         // Any re-sync invalidates the previous "no overlap" guarantee —
         // positions just shifted (new nodes, removed nodes, or a freshly
         // re-kicked sim), so the resolver must run again on the next settle.
         self.overlap_resolved = false;
+    }
+
+    /// Scale `Layout::k` to the widest rendered node so the force-sim's
+    /// equilibrium distance stays larger than any single node's rectangle.
+    /// Without this, `k = 55` pulls edge-connected nodes to `d ≈ 55` world
+    /// units — smaller than most label widths (`business-hours-card`,
+    /// `customer-portal-step`) — so rects end up stacked at rest. Called
+    /// after every `layout.sync` so new nodes / filter toggles recalibrate.
+    ///
+    /// Uses a character-count heuristic rather than real text measurement
+    /// because it runs during `load_folder`, before the first `draw_canvas`
+    /// frame has a `ui` in hand. The approximation overestimates slightly,
+    /// which is the safe direction — "too much whitespace" beats "overlap."
+    fn calibrate_layout_spring_constant(&mut self) {
+        let mut max_chars = 0usize;
+        for (id, node) in &self.graph.nodes {
+            if self.filter_state.is_hidden(id) {
+                continue;
+            }
+            let len = crate::node_label::display_label(node).chars().count();
+            if len > max_chars {
+                max_chars = len;
+            }
+        }
+        let approx_extent =
+            max_chars as f32 * APPROX_CHAR_WIDTH_WORLD + APPROX_RECT_H_PADDING_TOTAL;
+        self.layout.k = (approx_extent + K_SPACING_MARGIN).max(K_SPACING_FLOOR);
     }
 
     /// React to a file-level filter toggle: drop hidden nodes from the
