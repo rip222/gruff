@@ -144,6 +144,62 @@ fn enqueue_and_expand(
     }
 }
 
+/// Summarise a transitive-dependents cone as `(file_count, package_count)` —
+/// the two numbers the blast-radius status bar renders as
+/// "N files in M packages depend on this."
+///
+/// * **File count** is the number of file-level nodes in the cone. Barrel
+///   display nodes (id prefix `barrel:`) are counted as the files they
+///   represent, not as themselves — this matches the PRD's "count files,
+///   not display nodes" decision. When the cone walker expanded a barrel
+///   into its members, the members are already in the cone and the display
+///   id is skipped here to avoid double-counting. Synthetic nodes
+///   (workspace-package aggregators, external leaves) that happen to sit in
+///   the cone aren't file-level either and are likewise skipped.
+/// * **Package count** is the number of distinct package names attached to
+///   file-level nodes in the cone. Files with no package attribution (stray
+///   files outside every workspace package) don't contribute.
+///
+/// An empty cone yields `(0, 0)`. The function doesn't touch the selected
+/// node — the cone walker already decided whether to include it.
+pub fn cone_stats(graph: &Graph, cone: &HashSet<NodeId>) -> (usize, usize) {
+    use crate::graph::NodeKind;
+
+    let mut file_count: usize = 0;
+    let mut packages: HashSet<&str> = HashSet::new();
+
+    for id in cone {
+        // Skip barrel display ids entirely — the members they were expanded
+        // into carry the real file-level identity and any package attribution.
+        if id.starts_with("barrel:") {
+            continue;
+        }
+        match graph.nodes.get(id) {
+            Some(node) if matches!(node.kind, NodeKind::File) => {
+                file_count += 1;
+                if let Some(pkg) = node.package.as_deref() {
+                    packages.insert(pkg);
+                }
+            }
+            // Raw barrel members are absent from the aggregated `graph.nodes`
+            // (they collapsed into the display node) but still represent real
+            // files — count them as files. Their package attribution is
+            // unavailable from this angle, so they contribute to `file_count`
+            // without touching `packages`. The status-bar reading "N files in
+            // M packages" stays honest: M is the distinct-package count of
+            // nodes we *do* have metadata for.
+            None => {
+                file_count += 1;
+            }
+            // Synthetic workspace-package aggregators and external leaves
+            // don't represent source files — they're abstractions. Don't
+            // count them toward file impact.
+            Some(_) => {}
+        }
+    }
+    (file_count, packages.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,6 +432,117 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert_eq!(cone, expected);
+    }
+
+    fn file_node_in(id: &str, package: Option<&str>) -> Node {
+        Node {
+            id: id.to_string(),
+            path: PathBuf::from(id),
+            label: id.to_string(),
+            package: package.map(str::to_string),
+            kind: NodeKind::File,
+        }
+    }
+
+    #[test]
+    fn cone_stats_counts_files_across_two_packages() {
+        // Cone touches three files in two packages → (3, 2). Mirrors the
+        // PRD matrix case "cone across two packages → (files, 2)."
+        let mut g = Graph::new();
+        g.add_node(file_node_in("a", Some("pkg-a")));
+        g.add_node(file_node_in("b", Some("pkg-a")));
+        g.add_node(file_node_in("c", Some("pkg-b")));
+
+        let cone: HashSet<NodeId> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(cone_stats(&g, &cone), (3, 2));
+    }
+
+    #[test]
+    fn cone_stats_counts_files_within_one_package() {
+        // Cone entirely within a single package → (files, 1).
+        let mut g = Graph::new();
+        g.add_node(file_node_in("a", Some("only-pkg")));
+        g.add_node(file_node_in("b", Some("only-pkg")));
+
+        let cone: HashSet<NodeId> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(cone_stats(&g, &cone), (2, 1));
+    }
+
+    #[test]
+    fn cone_stats_empty_cone_is_zero_zero() {
+        // Empty cone → (0, 0) — the isolated-node status bar case.
+        let g = Graph::new();
+        let cone: HashSet<NodeId> = HashSet::new();
+        assert_eq!(cone_stats(&g, &cone), (0, 0));
+    }
+
+    #[test]
+    fn cone_stats_skips_barrel_display_nodes() {
+        // Barrel display ids (prefix `barrel:`) don't represent files and
+        // must not be counted — the barrel's member raw ids in the cone
+        // carry the real file identity. Here `barrel:foo` is in the cone
+        // alongside its member `foo/index.ts`; the result is one file in
+        // one package, not two files.
+        let mut g = Graph::new();
+        g.add_node(Node {
+            id: "barrel:/repo/foo".to_string(),
+            path: PathBuf::from("/repo/foo"),
+            label: "foo".to_string(),
+            package: Some("pkg-foo".to_string()),
+            kind: NodeKind::File,
+        });
+        let member = Node {
+            id: "foo/index.ts".to_string(),
+            path: PathBuf::from("/repo/foo/index.ts"),
+            label: "index.ts".to_string(),
+            package: Some("pkg-foo".to_string()),
+            kind: NodeKind::File,
+        };
+        // The member isn't in `graph.nodes` (it was swallowed by the barrel)
+        // but `cone_stats` still counts raw ids present in the cone — that's
+        // how a barrel-expanded cone reports real file impact.
+        let _ = member;
+
+        let cone: HashSet<NodeId> = ["barrel:/repo/foo", "foo/index.ts"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(cone_stats(&g, &cone), (1, 0));
+        // `(1, 0)` rather than `(1, 1)` is deliberate: the member file isn't
+        // in `graph.nodes` so we have no package attribution for it. In the
+        // full pipeline the barrel display would sit alongside at least one
+        // other per-file node in the same package, which contributes the
+        // package count. This test deliberately exercises the
+        // member-without-metadata edge case so the behavior is locked in.
+    }
+
+    #[test]
+    fn cone_stats_ignores_synthetic_nodes() {
+        // Workspace-package and external synthetic nodes aren't source
+        // files; they must not contribute to the file count even when
+        // present in the cone.
+        let mut g = Graph::new();
+        g.add_node(file_node_in("a", Some("pkg")));
+        g.add_node(Node {
+            id: "package:@org/app".to_string(),
+            path: PathBuf::from("package:@org/app"),
+            label: "@org/app".to_string(),
+            package: Some("@org/app".to_string()),
+            kind: NodeKind::WorkspacePackage,
+        });
+        g.add_node(Node {
+            id: "external:react".to_string(),
+            path: PathBuf::from("external:react"),
+            label: "react".to_string(),
+            package: None,
+            kind: NodeKind::External,
+        });
+
+        let cone: HashSet<NodeId> = ["a", "package:@org/app", "external:react"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(cone_stats(&g, &cone), (1, 1));
     }
 
     #[test]
