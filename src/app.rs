@@ -769,9 +769,17 @@ impl GruffApp {
                     self.highlight = None;
                 }
             }
+            ShortcutAction::ToggleHelp => {
+                // Flip the modal. Clearing `show_help` here (rather than
+                // through the `Dismiss` branch) means the `?` key round-
+                // trips the modal open/closed, consistent with how Cmd+F
+                // round-trips the search overlay.
+                self.show_help = !self.show_help;
+            }
             ShortcutAction::Noop => {
-                // Placeholder entries (`B` pending issue #35, `?` wired in
-                // commit 4 of PRD #33). Fall through intentionally.
+                // Placeholder entry (`B` pending issue #35). Fall through
+                // intentionally — the registry keeps the row for
+                // documentation, but no app-side side effect fires.
             }
         }
     }
@@ -997,18 +1005,39 @@ fn collect_key_presses(ctx: &egui::Context) -> Vec<KeyPress> {
                 key, pressed: true, ..
             } = event
             {
-                let token = match key {
-                    egui::Key::O => "O",
-                    egui::Key::F => "F",
-                    egui::Key::R => "R",
-                    egui::Key::B => "B",
-                    egui::Key::Space => "SPACE",
-                    egui::Key::Escape => "ESC",
-                    egui::Key::Questionmark => "?",
-                    egui::Key::Slash => "/",
+                // `?` is the one key where the shift bit is part of how
+                // the user physically produces it on US layouts (Shift+/).
+                // Strip shift for both `Questionmark` and Shift+`Slash` so
+                // the registry entry — written plainly as `"?"` — matches
+                // whichever shape egui surfaces on the host keyboard.
+                let (token, emit_mods) = match key {
+                    egui::Key::O => ("O", mods),
+                    egui::Key::F => ("F", mods),
+                    egui::Key::R => ("R", mods),
+                    egui::Key::B => ("B", mods),
+                    egui::Key::Space => ("SPACE", mods),
+                    egui::Key::Escape => ("ESC", mods),
+                    egui::Key::Questionmark => (
+                        "?",
+                        ShortcutMods {
+                            shift: false,
+                            ..mods
+                        },
+                    ),
+                    egui::Key::Slash if mods.shift => (
+                        "?",
+                        ShortcutMods {
+                            shift: false,
+                            ..mods
+                        },
+                    ),
+                    egui::Key::Slash => ("/", mods),
                     _ => continue,
                 };
-                out.push(KeyPress { key: token, mods });
+                out.push(KeyPress {
+                    key: token,
+                    mods: emit_mods,
+                });
             }
         }
         out
@@ -1142,6 +1171,20 @@ impl eframe::App for GruffApp {
                         .changed()
                     {
                         self.set_collapse_barrels(collapse_barrels);
+                    }
+                });
+
+                // Right-aligned `?` button, the visual affordance hinting at
+                // the shortcut cheat-sheet. Must sit after the regular menu
+                // buttons so the right-to-left layout pushes it to the far
+                // edge without reordering the File/View menus to its left.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button("?")
+                        .on_hover_text("Keyboard shortcuts (?)")
+                        .clicked()
+                    {
+                        self.show_help = !self.show_help;
                     }
                 });
             });
@@ -1667,24 +1710,38 @@ mod tests {
     }
 
     #[test]
-    fn help_dispatch_is_noop_pre_wiring() {
-        // Help-group regression: the `?` placeholder is registered but
-        // deliberately unwired until commit 4 of PRD #33. Dispatching the
-        // `?` action via its `Noop` variant must be a safe no-op.
+    fn help_dispatch_toggles_help_modal() {
+        // Help-group regression: the `?` entry toggles the help modal.
+        // Fire it twice and expect the `show_help` flag to round-trip.
         let mut app = app_with_graph(abc_cycle_graph());
-        let before = (app.sim_enabled, app.selected.clone(), app.fit_request);
-        app.dispatch_shortcut(ShortcutAction::Noop);
-        let after = (app.sim_enabled, app.selected.clone(), app.fit_request);
-        assert_eq!(before, after, "Noop action must not mutate app state");
+        assert!(!app.show_help, "precondition: help modal starts closed");
+        app.dispatch_shortcut(ShortcutAction::ToggleHelp);
+        assert!(app.show_help, "first press must open the help modal");
+        app.dispatch_shortcut(ShortcutAction::ToggleHelp);
+        assert!(!app.show_help, "second press must close the help modal");
+
         let help_entry = shortcuts::SHORTCUTS
             .iter()
             .find(|s| s.group == ShortcutGroup::Help)
             .expect("Help group must have an entry");
         assert_eq!(
             help_entry.action,
-            ShortcutAction::Noop,
-            "Help entry is the `?` placeholder until commit 4 wires it"
+            ShortcutAction::ToggleHelp,
+            "Help entry must be wired to ToggleHelp",
         );
+        assert_eq!(help_entry.keys, "?", "Help entry keybind is `?`");
+    }
+
+    #[test]
+    fn noop_action_leaves_state_untouched() {
+        // The remaining `Noop` variant (the `B` placeholder for issue #35,
+        // and the sidebar-click documentation row) must not mutate state
+        // when dispatched — future placeholder additions must stay silent.
+        let mut app = app_with_graph(abc_cycle_graph());
+        let before = (app.sim_enabled, app.selected.clone(), app.fit_request);
+        app.dispatch_shortcut(ShortcutAction::Noop);
+        let after = (app.sim_enabled, app.selected.clone(), app.fit_request);
+        assert_eq!(before, after, "Noop action must not mutate app state");
     }
 
     #[test]

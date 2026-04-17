@@ -86,6 +86,8 @@ pub enum ShortcutAction {
     FitView,
     /// Dismiss whichever overlay is open, else clear selection (Escape).
     Dismiss,
+    /// Toggle the keyboard-shortcut cheat-sheet modal (`?` / Shift+/).
+    ToggleHelp,
     /// Reserved entry — dispatch is handled elsewhere or not yet wired.
     Noop,
 }
@@ -222,12 +224,11 @@ pub const SHORTCUTS: &[Shortcut] = &[
         group: ShortcutGroup::Filters,
         action: ShortcutAction::Noop,
     },
-    // Placeholder — commit 4 of this PRD wires this to toggle the help modal.
     Shortcut {
         keys: "?",
         label: "Show keyboard shortcuts",
         group: ShortcutGroup::Help,
-        action: ShortcutAction::Noop,
+        action: ShortcutAction::ToggleHelp,
     },
 ];
 
