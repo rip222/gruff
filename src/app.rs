@@ -8,6 +8,7 @@ use crate::aggregation::{self, BarrelMembers, PassthroughAggregator, TsBarrelAgg
 use crate::camera::Camera;
 use crate::colors;
 use crate::config::{self, Config};
+use crate::entry_points;
 use crate::error::{self, GruffError};
 use crate::export;
 use crate::filter_state::FilterState;
@@ -15,6 +16,7 @@ use crate::graph::{Graph, GraphDiff, NodeId};
 use crate::indexer::Indexer;
 use crate::layout::Layout;
 use crate::lib_detect::{self, LibDetector, TsLibDetector};
+use crate::orphan_detector::{self, OrphanSets};
 use crate::reachability;
 use crate::shortcuts::{self, KeyPress, ShortcutAction, ShortcutMods};
 use crate::watcher::{ChangeEvent, Watcher};
@@ -206,6 +208,13 @@ pub struct GruffApp {
     /// selection), which keeps "dim with nothing lit besides self" working
     /// correctly.
     blast_cone: Option<std::collections::HashSet<NodeId>>,
+    /// Dead-code orphan report (#36). Rebuilt after every full graph build
+    /// and after every watcher-driven incremental diff — not on filter
+    /// toggles, since hiding a file doesn't change the "is it imported by
+    /// anything?" question the user is trying to answer. The two sub-sets
+    /// back the Dead-code sidebar pane (commit 6) and the canvas's dashed-
+    /// border branch (commit 7).
+    orphan_sets: OrphanSets,
 }
 
 impl Default for GruffApp {
@@ -243,6 +252,7 @@ impl Default for GruffApp {
             blast_radius_active: true,
             barrel_members: BarrelMembers::empty(),
             blast_cone: None,
+            orphan_sets: OrphanSets::default(),
         }
     }
 }
@@ -331,6 +341,10 @@ impl GruffApp {
         self.install_filter_persist_callback(root.clone());
 
         self.rebuild_derived_indexes();
+        // Dead-code detector runs after the graph is fully installed so
+        // `entry_points::discover` walks the freshly-indexed workspace and
+        // `orphan_detector::detect` sees the final aggregated node set.
+        self.recompute_orphan_sets();
         self.frame_request = None;
         self.highlight = None;
         // Reset the search overlay on a new folder load — the cached match
@@ -416,6 +430,10 @@ impl GruffApp {
         // the cached cone is stale. Recompute now so the next paint uses
         // fresh edges / barrel membership.
         self.recompute_blast_cone();
+        // Test-file toggle reshapes the entry-point set (tests are entries)
+        // and the node set both — refresh the orphan report so the dead-code
+        // pane tracks the new graph.
+        self.recompute_orphan_sets();
         self.set_status_after_index(start.elapsed());
     }
 
@@ -456,6 +474,10 @@ impl GruffApp {
         // lookup — refresh the cone so a still-selected node reflects its
         // post-toggle cone rather than a stale one.
         self.recompute_blast_cone();
+        // Barrel toggle changes node ids (barrel display vs. per-file
+        // rawids), so the orphan report computed against the old ids is
+        // stale. Refresh against the newly-aggregated graph.
+        self.recompute_orphan_sets();
         self.set_status_after_index(start.elapsed());
     }
 
@@ -479,6 +501,10 @@ impl GruffApp {
             return;
         }
         self.rebuild_derived_indexes();
+        // Full rescan is exactly the moment the PRD calls out for an orphan
+        // recompute — every cached set above has been rebuilt, so the
+        // dead-code report has to follow suit.
+        self.recompute_orphan_sets();
         self.resync_layout();
         self.frame_request = None;
         self.highlight = None;
@@ -821,6 +847,24 @@ impl GruffApp {
         });
     }
 
+    /// Rebuild the cached dead-code orphan report from the current graph +
+    /// entry-point set. Called after every full graph build (folder load,
+    /// rescan, test / barrel toggles) and after every watcher-driven
+    /// incremental diff — the two moments the graph shape or the entry-point
+    /// discovery can produce a different answer. Runs against the full
+    /// graph, not the filtered view: hiding a file in the sidebar shouldn't
+    /// change whether that file is imported by anything, and the PRD
+    /// explicitly ties the recompute to "every full rescan and every
+    /// watcher diff." An app with no loaded workspace produces an empty
+    /// report (no entries, no nodes) without panicking.
+    pub(super) fn recompute_orphan_sets(&mut self) {
+        let entries = match self.indexer.as_ref() {
+            Some(indexer) => entry_points::discover(&indexer.ws, &self.config),
+            None => std::collections::HashSet::new(),
+        };
+        self.orphan_sets = orphan_detector::detect(&self.graph, &entries);
+    }
+
     /// Perform the side effects mapped to `action` by the shortcuts registry.
     /// Called by the frame loop once per matched key press. Per-action gates
     /// (overlay guards, "graph non-empty", etc.) live here so the registry
@@ -1081,6 +1125,11 @@ impl GruffApp {
         // Watcher diff may have changed edges under a still-live
         // selection — refresh the cone so the cone tracks the new shape.
         self.recompute_blast_cone();
+        // Incremental diff may have added or removed an import edge, which
+        // is exactly what the orphan report keys off — recompute so the
+        // Dead-code pane and the dashed-border canvas branch track the
+        // live graph instead of the pre-diff snapshot.
+        self.recompute_orphan_sets();
 
         self.status = format!(
             "{} files, {} edges, {} cycle{} — live",
@@ -2248,6 +2297,112 @@ mod tests {
         assert!(
             app.filter_state.is_empty(),
             "first load of a never-opened workspace must start with nothing hidden",
+        );
+    }
+
+    // --- orphan detection (#36) ------------------------------------------
+
+    #[test]
+    fn orphan_sets_match_known_shape_after_rebuild() {
+        // Known shape: `entry` has no importers but is the reachability
+        // root; `reachable` is imported by `entry` (so it's reachable AND
+        // has an incoming edge); `orphan` is imported by nothing and
+        // imports nothing. The detector must report:
+        //   - unreachable_from_entries: {orphan}
+        //   - no_incoming_imports: {entry, orphan}
+        // We drive `recompute_orphan_sets` directly with an empty entry
+        // set (no indexer, so discover returns empty) and then seed the
+        // orphan_sets field manually using the detector — this mirrors the
+        // production path which runs detect(&graph, &discover(ws, cfg)).
+        let mut g = Graph::new();
+        for id in ["entry", "reachable", "orphan"] {
+            g.add_node(file_node(id));
+        }
+        g.add_edge("entry", "reachable");
+        let app = app_with_graph(g.clone());
+
+        // With no indexer loaded, `recompute_orphan_sets` uses an empty
+        // entry set — so every node ends up unreachable. To get the
+        // "known entry set" branch, feed the detector directly; that's
+        // the same pass the app runs once the indexer is live.
+        let mut entries = std::collections::HashSet::new();
+        entries.insert("entry".to_string());
+        let sets = orphan_detector::detect(&app.graph, &entries);
+        let expected_unreachable: std::collections::HashSet<NodeId> =
+            std::iter::once("orphan".to_string()).collect();
+        assert_eq!(sets.unreachable_from_entries, expected_unreachable);
+        let expected_zero_in: std::collections::HashSet<NodeId> = ["entry", "orphan"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(sets.no_incoming_imports, expected_zero_in);
+    }
+
+    #[test]
+    fn no_indexer_recompute_yields_every_node_unreachable() {
+        // `recompute_orphan_sets` without a loaded indexer falls back to
+        // an empty entry set — every node is therefore "unreachable from
+        // entry." This is the documented graceful behavior so the test
+        // path (no `load_folder`) doesn't panic.
+        let mut g = Graph::new();
+        for id in ["a", "b"] {
+            g.add_node(file_node(id));
+        }
+        g.add_edge("a", "b");
+        let mut app = app_with_graph(g);
+        app.recompute_orphan_sets();
+        let expected: std::collections::HashSet<NodeId> =
+            ["a", "b"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(app.orphan_sets.unreachable_from_entries, expected);
+        // `b` has an incoming edge from `a`; only `a` has zero in-degree.
+        let expected_zero_in: std::collections::HashSet<NodeId> =
+            std::iter::once("a".to_string()).collect();
+        assert_eq!(app.orphan_sets.no_incoming_imports, expected_zero_in);
+    }
+
+    #[test]
+    fn adding_incoming_edge_drops_orphan_from_both_sets() {
+        // Start state: `orphan` is a leaf with no incoming edges, not
+        // reachable from `entry`. Both orphan sets contain it. Apply a
+        // `GraphDiff` that adds `entry -> orphan` (an incoming edge). After
+        // recompute, `orphan` must leave both sets: it gains an importer,
+        // and the forward walk from `entry` now reaches it.
+        use crate::graph::Edge;
+        let mut g = Graph::new();
+        for id in ["entry", "orphan"] {
+            g.add_node(file_node(id));
+        }
+        let mut app = app_with_graph(g);
+        let mut entries = std::collections::HashSet::new();
+        entries.insert("entry".to_string());
+        app.orphan_sets = orphan_detector::detect(&app.graph, &entries);
+        assert!(
+            app.orphan_sets.unreachable_from_entries.contains("orphan"),
+            "precondition: orphan is unreachable",
+        );
+        assert!(
+            app.orphan_sets.no_incoming_imports.contains("orphan"),
+            "precondition: orphan has zero in-degree",
+        );
+
+        let diff = GraphDiff {
+            added_nodes: Vec::new(),
+            removed_nodes: Vec::new(),
+            added_edges: vec![Edge {
+                from: "entry".into(),
+                to: "orphan".into(),
+            }],
+            removed_edges: Vec::new(),
+        };
+        app.graph.apply(&diff);
+        app.orphan_sets = orphan_detector::detect(&app.graph, &entries);
+        assert!(
+            !app.orphan_sets.unreachable_from_entries.contains("orphan"),
+            "orphan now reachable from entry — must leave unreachable set",
+        );
+        assert!(
+            !app.orphan_sets.no_incoming_imports.contains("orphan"),
+            "orphan now has an incoming edge — must leave zero-in-degree set",
         );
     }
 }
