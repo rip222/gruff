@@ -20,6 +20,7 @@ use crate::watcher::{ChangeEvent, Watcher};
 
 mod canvas;
 mod editor_prompt;
+mod help_modal;
 mod highlight;
 mod search;
 mod sidebar;
@@ -177,6 +178,12 @@ pub struct GruffApp {
     /// empty on every folder open per PRD #16 — the filter is memory-only
     /// and never persisted.
     filter_state: FilterState,
+    /// When true, the keyboard-shortcut cheat-sheet modal is visible on the
+    /// next paint. Kept as a plain `bool` because the modal has no internal
+    /// state beyond open/closed — the content is rendered directly from the
+    /// static shortcuts registry. Toggled by the `?` keybind and the help
+    /// button wired in commit 4 of PRD #33.
+    show_help: bool,
 }
 
 impl Default for GruffApp {
@@ -210,6 +217,7 @@ impl Default for GruffApp {
             watcher: None,
             last_root: None,
             filter_state: FilterState::new(),
+            show_help: false,
         }
     }
 }
@@ -1196,8 +1204,11 @@ impl eframe::App for GruffApp {
         // Drawn before the editor prompt so a modal still paints on top of
         // the search overlay — the modal is strictly more blocking.
         self.draw_search_overlay(&ctx);
-        // Drawn last so the modal paints over the sidebar and canvas.
         self.draw_editor_prompt(&ctx);
+        // Help modal paints last so it sits over every other overlay —
+        // it's the top layer the user can stack without losing dismiss
+        // priority for Escape / click-outside.
+        self.draw_help_modal(&ctx);
     }
 }
 
